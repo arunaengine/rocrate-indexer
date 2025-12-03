@@ -17,6 +17,7 @@ pub struct SearchIndex {
     pub(crate) occurs_in_field: Field,
     pub(crate) entity_type_field: Field,
     pub(crate) content_field: Field,
+    pub(crate) properties_field: Field,
 }
 
 impl SearchIndex {
@@ -51,6 +52,7 @@ impl SearchIndex {
             occurs_in_field: schema.get_field("occurs_in").unwrap(),
             entity_type_field: schema.get_field("entity_type").unwrap(),
             content_field: schema.get_field("content").unwrap(),
+            properties_field: schema.get_field("properties").unwrap(),
             index,
             reader,
         })
@@ -70,6 +72,8 @@ impl SearchIndex {
 
         // Full-text content (not stored, just indexed)
         builder.add_text_field("content", TEXT);
+
+        builder.add_json_field("properties", TEXT);
 
         builder.build()
     }
@@ -113,6 +117,7 @@ impl SearchIndex {
             let mut doc = TantivyDocument::new();
             doc.add_text(self.id_field, &resolved_id);
             doc.add_text(self.occurs_in_field, crate_id);
+            doc.add_field_value(self.properties_field, entity);
 
             for t in &types {
                 doc.add_text(self.entity_type_field, t);

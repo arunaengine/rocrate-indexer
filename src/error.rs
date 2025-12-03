@@ -26,4 +26,7 @@ pub enum IndexError {
 
     #[error("Opendirectory error: {0}")]
     OpenDirectory(#[from] tantivy::directory::error::OpenDirectoryError),
+
+    #[error("Invalid crate format: {0}")]
+    InvalidCrateFormat(String),
 }

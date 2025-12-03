@@ -158,11 +158,13 @@ impl CrateIndex {
     /// Convert RoCrate graph to JSON values for indexing
     fn graph_to_json(&self, crate_data: &RoCrate) -> Result<Vec<serde_json::Value>, IndexError> {
         // Serialize the whole crate to get the @graph array
-        let json = serde_json::to_value(crate_data)?;
+        let json = serde_json::to_value(crate_data.graph.clone())?;
 
-        match json.get("@graph") {
-            Some(serde_json::Value::Array(arr)) => Ok(arr.clone()),
-            _ => Ok(vec![]),
+        match json {
+            serde_json::Value::Array(arr) => Ok(arr),
+            _ => Err(IndexError::InvalidCrateFormat(
+                "Expected @graph to be an array".to_string(),
+            )),
         }
     }
 }
