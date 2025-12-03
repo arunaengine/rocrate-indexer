@@ -1,13 +1,16 @@
 use std::collections::HashSet;
 use tantivy::{
-    Term,
     collector::TopDocs,
     query::{BooleanQuery, Occur, QueryParser, TermQuery},
     schema::{IndexRecordOption, Value},
+    Term,
 };
 
 use crate::error::IndexError;
 use crate::index::SearchIndex;
+
+/// Known top-level fields that should not be prefixed with "properties."
+const KNOWN_FIELDS: &[&str] = &["id", "occurs_in", "entity_type", "content", "properties"];
 
 /// A single search result
 #[derive(Debug, Clone)]
@@ -27,10 +30,80 @@ impl<'a> QueryEngine<'a> {
         Self { index }
     }
 
+    /// Preprocess a query to add "properties." prefix to unknown field paths
+    ///
+    /// Examples:
+    /// - "author.name:Smith" -> "properties.author.name:Smith"
+    /// - "content:Smith" -> "content:Smith" (known field, unchanged)
+    /// - "Smith" -> "Smith" (no field, unchanged)
+    fn preprocess_query(&self, query_str: &str) -> String {
+        // Simple preprocessing: find field:value patterns and prefix unknown fields
+        let mut result = String::new();
+        let mut chars = query_str.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '"' {
+                // Inside quoted string, copy as-is until closing quote
+                result.push(c);
+                while let Some(inner) = chars.next() {
+                    result.push(inner);
+                    if inner == '"' {
+                        break;
+                    }
+                    if inner == '\\' {
+                        if let Some(escaped) = chars.next() {
+                            result.push(escaped);
+                        }
+                    }
+                }
+            } else if c.is_alphabetic() || c == '_' || c == '@' {
+                // Potential field name
+                let mut word = String::new();
+                word.push(c);
+
+                while let Some(&next) = chars.peek() {
+                    if next.is_alphanumeric() || next == '_' || next == '.' || next == '@' {
+                        word.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+
+                // Check if followed by colon (field query)
+                if chars.peek() == Some(&':') {
+                    chars.next(); // consume colon
+
+                    // Check if this is a known field
+                    let field_root = word.split('.').next().unwrap_or(&word);
+                    if KNOWN_FIELDS.contains(&field_root) {
+                        result.push_str(&word);
+                        result.push(':');
+                    } else {
+                        // Prefix with properties.
+                        result.push_str("properties.");
+                        result.push_str(&word);
+                        result.push(':');
+                    }
+                } else {
+                    result.push_str(&word);
+                }
+            } else {
+                result.push(c);
+            }
+        }
+
+        result
+    }
+
     /// Full-text search across content
     pub fn search(&self, query_str: &str, limit: usize) -> Result<Vec<SearchHit>, IndexError> {
-        let parser = QueryParser::for_index(&self.index.index, vec![self.index.content_field]);
-        let query = parser.parse_query(query_str)?;
+        let processed_query = self.preprocess_query(query_str);
+
+        let parser = QueryParser::for_index(
+            &self.index.index,
+            vec![self.index.content_field, self.index.properties_field],
+        );
+        let query = parser.parse_query(&processed_query)?;
 
         let searcher = self.index.searcher();
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
@@ -75,9 +148,12 @@ impl<'a> QueryEngine<'a> {
         let type_term = Term::from_field_text(self.index.entity_type_field, type_name);
         let type_query = TermQuery::new(type_term, IndexRecordOption::Basic);
 
-        let content_parser =
-            QueryParser::for_index(&self.index.index, vec![self.index.content_field]);
-        let content_query = content_parser.parse_query(content_query)?;
+        let processed_query = self.preprocess_query(content_query);
+        let content_parser = QueryParser::for_index(
+            &self.index.index,
+            vec![self.index.content_field, self.index.properties_field],
+        );
+        let content_query = content_parser.parse_query(&processed_query)?;
 
         let combined = BooleanQuery::new(vec![
             (Occur::Must, Box::new(type_query)),
@@ -138,5 +214,54 @@ impl<'a> QueryEngine<'a> {
         }
 
         Ok(hits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_preprocess_query_no_field() {
+        let index = SearchIndex::new_in_memory().unwrap();
+        let engine = QueryEngine::new(&index);
+
+        assert_eq!(engine.preprocess_query("Smith"), "Smith");
+        assert_eq!(engine.preprocess_query("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_preprocess_query_known_field() {
+        let index = SearchIndex::new_in_memory().unwrap();
+        let engine = QueryEngine::new(&index);
+
+        assert_eq!(engine.preprocess_query("content:Smith"), "content:Smith");
+        assert_eq!(
+            engine.preprocess_query("entity_type:Person"),
+            "entity_type:Person"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_query_unknown_field() {
+        let index = SearchIndex::new_in_memory().unwrap();
+        let engine = QueryEngine::new(&index);
+
+        assert_eq!(
+            engine.preprocess_query("author.name:Smith"),
+            "properties.author.name:Smith"
+        );
+        assert_eq!(engine.preprocess_query("name:Test"), "properties.name:Test");
+    }
+
+    #[test]
+    fn test_preprocess_query_mixed() {
+        let index = SearchIndex::new_in_memory().unwrap();
+        let engine = QueryEngine::new(&index);
+
+        assert_eq!(
+            engine.preprocess_query("entity_type:Person AND author.name:Smith"),
+            "entity_type:Person AND properties.author.name:Smith"
+        );
     }
 }

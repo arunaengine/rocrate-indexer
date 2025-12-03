@@ -1,8 +1,8 @@
 use std::path::Path;
 use tantivy::{
-    Index, IndexReader, IndexSettings, IndexWriter, TantivyDocument, Term,
     directory::MmapDirectory,
-    schema::{FAST, Field, STORED, STRING, Schema, TEXT},
+    schema::{Field, Schema, FAST, STORED, STRING, TEXT},
+    Index, IndexReader, IndexSettings, IndexWriter, TantivyDocument, Term,
 };
 
 use crate::error::IndexError;
@@ -33,6 +33,7 @@ impl SearchIndex {
         let schema = Self::build_schema();
 
         let index = if path.exists() {
+            println!("Opening existing index at {:?}", path);
             Index::open_in_dir(path)?
         } else {
             std::fs::create_dir_all(path)?;
