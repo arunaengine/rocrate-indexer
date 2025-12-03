@@ -1,16 +1,13 @@
 use std::collections::HashSet;
 use tantivy::{
+    Term,
     collector::TopDocs,
     query::{BooleanQuery, Occur, QueryParser, TermQuery},
     schema::{IndexRecordOption, Value},
-    Term,
 };
 
 use crate::error::IndexError;
 use crate::index::SearchIndex;
-
-/// Known top-level fields that should not be prefixed with "properties."
-const KNOWN_FIELDS: &[&str] = &["id", "occurs_in", "entity_type", "content", "properties"];
 
 /// A single search result
 #[derive(Debug, Clone)]
@@ -30,69 +27,25 @@ impl<'a> QueryEngine<'a> {
         Self { index }
     }
 
-    /// Preprocess a query to add "properties." prefix to unknown field paths
+    /// Preprocess a query - currently just passes through
+    ///
+    /// Since "properties" is a default field in the QueryParser, Tantivy will
+    /// automatically search JSON paths in that field when an unknown field name
+    /// is specified. For example, searching "author.name:Smith" will look for
+    /// the path "author.name" in the default JSON fields.
+    ///
+    /// We do NOT prefix unknown fields with "properties." because:
+    /// 1. Tantivy's QueryParser handles this automatically for default fields
+    /// 2. Prefixing causes issues with how QueryParser parses field.path:value
     ///
     /// Examples:
-    /// - "author.name:Smith" -> "properties.author.name:Smith"
-    /// - "content:Smith" -> "content:Smith" (known field, unchanged)
-    /// - "Smith" -> "Smith" (no field, unchanged)
+    /// - "Smith" -> searches content and properties (all text values)
+    /// - "content:Smith" -> searches content field
+    /// - "author.name:Smith" -> searches properties JSON field at path author.name
+    /// - "name:Test" -> searches properties JSON field at path name
     fn preprocess_query(&self, query_str: &str) -> String {
-        // Simple preprocessing: find field:value patterns and prefix unknown fields
-        let mut result = String::new();
-        let mut chars = query_str.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if c == '"' {
-                // Inside quoted string, copy as-is until closing quote
-                result.push(c);
-                while let Some(inner) = chars.next() {
-                    result.push(inner);
-                    if inner == '"' {
-                        break;
-                    }
-                    if inner == '\\' {
-                        if let Some(escaped) = chars.next() {
-                            result.push(escaped);
-                        }
-                    }
-                }
-            } else if c.is_alphabetic() || c == '_' || c == '@' {
-                // Potential field name
-                let mut word = String::new();
-                word.push(c);
-
-                while let Some(&next) = chars.peek() {
-                    if next.is_alphanumeric() || next == '_' || next == '.' || next == '@' {
-                        word.push(chars.next().unwrap());
-                    } else {
-                        break;
-                    }
-                }
-
-                // Check if followed by colon (field query)
-                if chars.peek() == Some(&':') {
-                    chars.next(); // consume colon
-
-                    // Check if this is a known field
-                    let field_root = word.split('.').next().unwrap_or(&word);
-                    if KNOWN_FIELDS.contains(&field_root) {
-                        result.push_str(&word);
-                        result.push(':');
-                    } else {
-                        // Prefix with properties.
-                        result.push_str("properties.");
-                        result.push_str(&word);
-                        result.push(':');
-                    }
-                } else {
-                    result.push_str(&word);
-                }
-            } else {
-                result.push(c);
-            }
-        }
-
-        result
+        // Pass through - QueryParser handles JSON paths in default fields automatically
+        query_str.to_string()
     }
 
     /// Full-text search across content
@@ -243,15 +196,16 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_query_unknown_field() {
+    fn test_preprocess_query_passthrough() {
         let index = SearchIndex::new_in_memory().unwrap();
         let engine = QueryEngine::new(&index);
 
+        // Queries pass through unchanged - QueryParser handles JSON paths automatically
         assert_eq!(
             engine.preprocess_query("author.name:Smith"),
-            "properties.author.name:Smith"
+            "author.name:Smith"
         );
-        assert_eq!(engine.preprocess_query("name:Test"), "properties.name:Test");
+        assert_eq!(engine.preprocess_query("name:Test"), "name:Test");
     }
 
     #[test]
@@ -261,7 +215,7 @@ mod tests {
 
         assert_eq!(
             engine.preprocess_query("entity_type:Person AND author.name:Smith"),
-            "entity_type:Person AND properties.author.name:Smith"
+            "entity_type:Person AND author.name:Smith"
         );
     }
 }
