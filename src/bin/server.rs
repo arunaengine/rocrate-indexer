@@ -1,8 +1,8 @@
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,8 @@ use rocrate_indexer::{CrateIndex, CrateSource, SharedCrateIndex};
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        add_crate,
+        add_crate_by_url,
+        add_crate_by_upload,
         list_crates,
         get_crate,
         remove_crate,
@@ -25,9 +26,9 @@ use rocrate_indexer::{CrateIndex, CrateSource, SharedCrateIndex};
     ),
     components(
         schemas(
-            AddCrateRequest,
+            AddCrateByUrlRequest,
             AddCrateResponse,
-            SubcrateResult,
+            CrateAddedInfo,
             ListCratesResponse,
             SearchParams,
             SearchResponse,
@@ -45,29 +46,30 @@ struct ApiDoc;
 // === Request/Response Types ===
 
 #[derive(Debug, Deserialize, ToSchema)]
-struct AddCrateRequest {
-    /// Path to directory/zip or URL to ro-crate-metadata.json
-    source: String,
+struct AddCrateByUrlRequest {
+    /// URL to ro-crate-metadata.json
+    url: String,
+}
+
+/// Information about a single crate that was added
+#[derive(Debug, Serialize, ToSchema)]
+struct CrateAddedInfo {
+    /// The unique identifier for the crate
+    crate_id: String,
+    /// Number of entities indexed from this crate
+    entity_count: usize,
+    /// Whether this was a subcrate discovered during indexing
+    is_subcrate: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 struct AddCrateResponse {
-    /// The unique identifier for the added crate
-    crate_id: String,
-    /// Number of entities indexed from this crate
-    entity_count: usize,
-    /// Subcrates that were discovered and indexed
-    subcrates: Vec<SubcrateResult>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-struct SubcrateResult {
-    /// The unique identifier for the subcrate
-    crate_id: String,
-    /// Number of entities indexed from this subcrate
-    entity_count: usize,
-    /// Nested subcrates
-    subcrates: Vec<SubcrateResult>,
+    /// The primary crate that was added
+    primary_crate: CrateAddedInfo,
+    /// All subcrates that were discovered and indexed (flattened)
+    subcrates: Vec<CrateAddedInfo>,
+    /// Total number of crates added (primary + subcrates)
+    total_crates_added: usize,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -123,56 +125,56 @@ struct ErrorResponse {
 
 // === Helper Functions ===
 
+/// Flatten the recursive AddResult into a flat response
 fn convert_add_result(result: rocrate_indexer::AddResult) -> AddCrateResponse {
+    let mut subcrates = Vec::new();
+    collect_subcrates(&result.subcrates, &mut subcrates);
+
+    let total = 1 + subcrates.len();
+
     AddCrateResponse {
-        crate_id: result.crate_id,
-        entity_count: result.entity_count,
-        subcrates: result.subcrates.into_iter().map(convert_subcrate).collect(),
+        primary_crate: CrateAddedInfo {
+            crate_id: result.crate_id,
+            entity_count: result.entity_count,
+            is_subcrate: false,
+        },
+        subcrates,
+        total_crates_added: total,
     }
 }
 
-fn convert_subcrate(result: rocrate_indexer::AddResult) -> SubcrateResult {
-    SubcrateResult {
-        crate_id: result.crate_id,
-        entity_count: result.entity_count,
-        subcrates: result.subcrates.into_iter().map(convert_subcrate).collect(),
-    }
-}
-
-fn parse_source(source: &str) -> CrateSource {
-    if source.starts_with("http://") || source.starts_with("https://") {
-        CrateSource::Url(source.to_string())
-    } else {
-        let path = std::path::PathBuf::from(source);
-        if path.is_dir() {
-            CrateSource::Directory(path)
-        } else {
-            CrateSource::ZipFile(path)
-        }
+/// Recursively collect all subcrates into a flat list
+fn collect_subcrates(results: &[rocrate_indexer::AddResult], out: &mut Vec<CrateAddedInfo>) {
+    for result in results {
+        out.push(CrateAddedInfo {
+            crate_id: result.crate_id.clone(),
+            entity_count: result.entity_count,
+            is_subcrate: true,
+        });
+        collect_subcrates(&result.subcrates, out);
     }
 }
 
 // === Handlers ===
 
-/// Add an RO-Crate from a path or URL
+/// Add an RO-Crate from a URL
 #[utoipa::path(
     post,
-    path = "/crates",
+    path = "/crates/url",
     tag = "crates",
-    request_body = AddCrateRequest,
+    request_body = AddCrateByUrlRequest,
     responses(
         (status = 201, description = "Crate added successfully", body = AddCrateResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
-async fn add_crate(
+async fn add_crate_by_url(
     State(index): State<SharedCrateIndex>,
-    Json(req): Json<AddCrateRequest>,
+    Json(req): Json<AddCrateByUrlRequest>,
 ) -> impl IntoResponse {
-    let source = parse_source(&req.source);
+    let source = CrateSource::Url(req.url);
 
-    // Run blocking index operation in a separate thread
     let result = tokio::task::spawn_blocking(move || {
         let mut idx = index.write().map_err(|e| format!("Lock error: {}", e))?;
         idx.add_from_source(&source)
@@ -197,6 +199,108 @@ async fn add_crate(
         )
             .into_response(),
     }
+}
+
+/// Add an RO-Crate by uploading a file (zip archive or ro-crate-metadata.json)
+#[utoipa::path(
+    post,
+    path = "/crates/upload",
+    tag = "crates",
+    request_body(
+        content_type = "multipart/form-data",
+        content = Vec<u8>,
+        description = "Upload a zip archive or ro-crate-metadata.json file"
+    ),
+    responses(
+        (status = 201, description = "Crate added successfully", body = AddCrateResponse),
+        (status = 400, description = "Invalid request or file", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    )
+)]
+async fn add_crate_by_upload(
+    State(index): State<SharedCrateIndex>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    // Extract file from multipart
+    let (filename, data) = match extract_file_from_multipart(&mut multipart).await {
+        Ok(result) => result,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response();
+        }
+    };
+
+    // Determine file type and process
+    let is_zip = filename.ends_with(".zip") || data.starts_with(&[0x50, 0x4B, 0x03, 0x04]); // ZIP magic bytes
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut idx = index.write().map_err(|e| format!("Lock error: {}", e))?;
+
+        if is_zip {
+            // Write to temp file and load
+            let temp_path =
+                std::env::temp_dir().join(format!("rocrate_{}.zip", uuid::Uuid::new_v4()));
+            std::fs::write(&temp_path, &data)
+                .map_err(|e| format!("Failed to write temp file: {}", e))?;
+
+            let result = idx.add_from_source(&CrateSource::ZipFile(temp_path.clone()));
+
+            // Clean up temp file
+            let _ = std::fs::remove_file(&temp_path);
+
+            result.map_err(|e| format!("Failed to add crate: {}", e))
+        } else {
+            // Assume JSON metadata
+            let json_str =
+                String::from_utf8(data).map_err(|e| format!("Invalid UTF-8 in file: {}", e))?;
+
+            idx.add_from_json(&json_str, &filename)
+                .map_err(|e| format!("Failed to add crate: {}", e))
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(add_result)) => {
+            (StatusCode::CREATED, Json(convert_add_result(add_result))).into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Task join error: {}", e),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Extract filename and data from multipart upload
+async fn extract_file_from_multipart(
+    multipart: &mut Multipart,
+) -> Result<(String, Vec<u8>), String> {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| format!("Failed to read multipart field: {}", e))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            let filename = field.file_name().unwrap_or("upload.json").to_string();
+
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to read file data: {}", e))?;
+
+            return Ok((filename, data.to_vec()));
+        }
+    }
+
+    Err("No file field found in multipart request".to_string())
 }
 
 /// List all indexed crate IDs
@@ -263,7 +367,6 @@ async fn get_crate(
 
     match result {
         Ok(Ok(Some(json))) => {
-            // Return raw JSON string with proper content type
             (StatusCode::OK, [("content-type", "application/json")], json).into_response()
         }
         Ok(Ok(None)) => (
@@ -306,12 +409,9 @@ async fn remove_crate(
     State(index): State<SharedCrateIndex>,
     Path(crate_id): Path<String>,
 ) -> impl IntoResponse {
-    //let crate_id_check = crate_id.clone();
-
     let result = tokio::task::spawn_blocking(move || {
         let mut idx = index.write().map_err(|e| format!("Lock error: {}", e))?;
 
-        // Check if crate exists first
         if !idx.list_crates().contains(&crate_id) {
             return Err("Crate not found".to_string());
         }
@@ -382,7 +482,6 @@ async fn search(
             (StatusCode::OK, Json(response)).into_response()
         }
         Ok(Err(e)) => {
-            // Check if it's a query parse error
             if e.contains("parse") || e.contains("Parse") {
                 (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response()
             } else {
@@ -407,7 +506,6 @@ async fn search(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command line args for port
     let port = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -415,7 +513,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
 
-    // Initialize the index
     println!("Initializing RO-Crate index...");
     let index = CrateIndex::open_or_create()?;
     let crate_count = index.crate_count();
@@ -425,19 +522,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let swagger = SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi());
 
-    // Build router
     let app = Router::new()
         .merge(swagger)
-        // API routes
-        .route("/crates", post(add_crate))
+        .route("/", get(|| async { Redirect::permanent("/swagger-ui") }))
         .route("/crates", get(list_crates))
+        .route("/crates/url", post(add_crate_by_url))
+        .route("/crates/upload", post(add_crate_by_upload))
         .route("/crates/{crate_id}", get(get_crate))
         .route("/crates/{crate_id}", delete(remove_crate))
         .route("/search", get(search))
-        // Swagger UI
-        // State
         .with_state(shared_index)
-        // CORS
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

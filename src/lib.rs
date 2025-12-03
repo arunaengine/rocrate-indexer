@@ -323,6 +323,53 @@ impl CrateIndex {
             )),
         }
     }
+
+    /// Add a crate directly from JSON string (for file uploads)
+    pub fn add_from_json(
+        &mut self,
+        json_str: &str,
+        name_hint: &str,
+    ) -> Result<AddResult, IndexError> {
+        // Parse the JSON
+        let crate_data = rocraters::ro_crate::read::read_crate_obj(json_str, 0).map_err(|e| {
+            IndexError::LoadError {
+                path: name_hint.to_string(),
+                reason: format!("{:#?}", e),
+            }
+        })?;
+
+        // Generate a crate ID
+        let crate_id = format!("{}-{}", uuid::Uuid::new_v4(), name_hint);
+
+        // Save metadata to disk
+        let metadata_path = self.config.metadata_path_for_crate(&crate_id);
+        std::fs::write(&metadata_path, json_str)?;
+
+        // Convert to JSON for indexing and subcrate detection
+        let entities = self.graph_to_json(&crate_data)?;
+
+        // Detect subcrates (no base URL for uploaded files)
+        let subcrate_infos = detect_subcrates(&entities, None);
+
+        // Index the crate
+        let entity_count = self.index_crate(&crate_id, &entities)?;
+
+        // Store in memory
+        self.store.insert(crate_id.clone(), crate_data);
+
+        // Update manifest
+        self.manifest.add_crate(crate_id.clone());
+        self.config.save_manifest(&self.manifest)?;
+
+        // Recursively add subcrates
+        let subcrates = self.add_subcrates(subcrate_infos)?;
+
+        Ok(AddResult {
+            crate_id,
+            entity_count,
+            subcrates,
+        })
+    }
 }
 
 #[cfg(test)]
