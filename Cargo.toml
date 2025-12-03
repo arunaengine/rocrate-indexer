@@ -1,7 +1,7 @@
 [package]
 name = "rocrate-indexer"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 name = "rocrate_indexer"
@@ -26,7 +26,7 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 
-# For the web server (Phase 8)
+# Web server
 tokio = { version = "1", features = ["full"] }
 axum = "0.8.7"
 utoipa = { version = "5", features = ["axum_extras"] }
