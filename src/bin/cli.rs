@@ -32,6 +32,9 @@ enum Commands {
         /// Maximum number of results
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Show only unique crate IDs (deduplicate by crate)
+        #[arg(long)]
+        crates_only: bool,
     },
     /// List all indexed crate IDs
     List,
@@ -52,25 +55,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut index = CrateIndex::open_or_create()?;
 
-    println!("Opened index with {} crates.", index.list_crates().len());
-
     match cli.command {
         Commands::Add { source } => {
             let crate_source = parse_source(&source);
             let result = index.add_from_source(&crate_source)?;
             print_add_result(&result, 0);
         }
-        Commands::Search { query, limit } => {
+        Commands::Search {
+            query,
+            limit,
+            crates_only,
+        } => {
             let hits = index.search(&query, limit)?;
             if hits.is_empty() {
                 println!("No results found.");
-            } else {
-                // Deduplicate by crate_id, keep highest score
+            } else if crates_only {
+                // Deduplicate by crate_id
                 let mut seen = std::collections::HashSet::new();
                 for hit in hits {
                     if seen.insert(hit.crate_id.clone()) {
                         println!("{}", hit.crate_id);
                     }
+                }
+            } else {
+                // Show entity and crate for each hit
+                for hit in hits {
+                    println!("Entity: {}", hit.entity_id);
+                    println!("  Crate: {}", hit.crate_id);
+                    println!("  Score: {:.4}", hit.score);
+                    println!();
                 }
             }
         }
