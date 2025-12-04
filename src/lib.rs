@@ -140,7 +140,7 @@ impl CrateIndex {
             });
         }
 
-        let (crate_data, raw_json) = loader::load_with_json(source)?;
+        let (crate_data, raw_json, root_prefix) = loader::load_with_json(source)?;
 
         // Save metadata to disk
         let metadata_path = self.config.metadata_path_for_crate(&crate_id);
@@ -160,7 +160,8 @@ impl CrateIndex {
         self.config.save_manifest(&self.manifest)?;
 
         // Discover and add subcrates based on source type
-        let subcrates = self.discover_and_add_subcrates(source, &crate_id, &entities)?;
+        let subcrates =
+            self.discover_and_add_subcrates(source, &crate_id, &entities, &root_prefix)?;
 
         Ok(AddResult {
             crate_id,
@@ -175,6 +176,7 @@ impl CrateIndex {
         source: &CrateSource,
         parent_id: &str,
         entities: &[serde_json::Value],
+        root_prefix: &str,
     ) -> Result<Vec<AddResult>, IndexError> {
         match source {
             CrateSource::Url(_) | CrateSource::UrlSubcrate { .. } => {
@@ -183,9 +185,10 @@ impl CrateIndex {
                 let subcrate_infos = detect_subcrates_from_url(entities, base_url.as_deref());
                 self.add_url_subcrates(parent_id, subcrate_infos)
             }
-            CrateSource::ZipFile(zip_path) | CrateSource::ZipSubcrate { zip_path, .. } => {
+            CrateSource::ZipFile { path: zip_path, .. }
+            | CrateSource::ZipSubcrate { zip_path, .. } => {
                 // For zip sources, scan the archive for metadata files
-                self.add_zip_subcrates(parent_id, zip_path, entities)
+                self.add_zip_subcrates(parent_id, zip_path, entities, root_prefix)
             }
             CrateSource::Directory(dir_path) => {
                 // For directory sources, look for subdirectories with metadata
@@ -214,7 +217,6 @@ impl CrateIndex {
                 }
             } else {
                 // Relative path - this shouldn't happen for URL sources after resolution
-                // but handle it just in case
                 continue;
             };
 
@@ -242,16 +244,16 @@ impl CrateIndex {
         parent_id: &str,
         zip_path: &std::path::PathBuf,
         entities: &[serde_json::Value],
+        root_prefix: &str,
     ) -> Result<Vec<AddResult>, IndexError> {
-        // Get potential subcrate entity IDs
+        // Get potential subcrate entity IDs from the graph
         let entity_ids = get_subcrate_entity_ids(entities);
         if entity_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         // Check for URL subcrates first (external references from zip)
-        let base_url = None; // Zips don't have base URLs
-        let url_subcrates: Vec<_> = detect_subcrates_from_url(entities, base_url)
+        let url_subcrates: Vec<_> = detect_subcrates_from_url(entities, None)
             .into_iter()
             .filter(|s| !s.is_relative)
             .collect();
@@ -259,8 +261,8 @@ impl CrateIndex {
         // Add URL subcrates
         let mut results = self.add_url_subcrates(parent_id, url_subcrates)?;
 
-        // Find matching metadata files in the zip
-        let zip_matches = find_subcrate_metadata_in_zip(zip_path, &entity_ids)?;
+        // Find matching metadata files in the zip based on entity IDs
+        let zip_matches = find_subcrate_metadata_in_zip(zip_path, &entity_ids, root_prefix)?;
 
         for (entity_id, metadata_path) in zip_matches {
             let source = CrateSource::ZipSubcrate {
@@ -310,8 +312,7 @@ impl CrateIndex {
             }
 
             // Look for metadata file in subdirectory
-            let has_metadata = find_metadata_in_dir(&subdir);
-            if !has_metadata {
+            if !find_metadata_in_dir(&subdir) {
                 continue;
             }
 
@@ -323,7 +324,7 @@ impl CrateIndex {
                 continue;
             }
 
-            // We need to load and index manually to preserve the ID
+            // Load and index with inherited ID
             match self.add_directory_subcrate(&subcrate_id, &subdir) {
                 Ok(result) => results.push(result),
                 Err(e) => {
@@ -404,7 +405,7 @@ impl CrateIndex {
         let source = if path.is_dir() {
             CrateSource::Directory(path.to_path_buf())
         } else {
-            CrateSource::ZipFile(path.to_path_buf())
+            CrateSource::zip(path.to_path_buf())
         };
         self.add_from_source(&source)
     }
@@ -514,22 +515,30 @@ impl CrateIndex {
         }
     }
 
-    /// Add a crate directly from JSON string (for file uploads)
+    /// Add a crate directly from JSON string (for file uploads without zip)
     pub fn add_from_json(
         &mut self,
         json_str: &str,
-        name_hint: &str,
+        name_hint: Option<&str>,
     ) -> Result<AddResult, IndexError> {
         // Parse the JSON
         let crate_data = rocraters::ro_crate::read::read_crate_obj(json_str, 0).map_err(|e| {
             IndexError::LoadError {
-                path: name_hint.to_string(),
+                path: name_hint.unwrap_or("upload").to_string(),
                 reason: format!("{:#?}", e),
             }
         })?;
 
         // Generate a crate ID using ULID
-        let crate_id = format!("{}/{}", ulid::Ulid::new(), name_hint);
+        let crate_id = match name_hint {
+            Some(name) => {
+                let clean_name = name
+                    .trim_end_matches(".json")
+                    .trim_end_matches("-ro-crate-metadata");
+                format!("{}/{}", ulid::Ulid::new(), clean_name)
+            }
+            None => ulid::Ulid::new().to_string(),
+        };
 
         // Cycle detection
         if self.is_indexed(&crate_id) {
@@ -569,6 +578,19 @@ impl CrateIndex {
             entity_count,
             subcrates,
         })
+    }
+
+    /// Add a crate from a zip file with an optional name hint
+    pub fn add_from_zip_with_name(
+        &mut self,
+        path: &Path,
+        name_hint: Option<&str>,
+    ) -> Result<AddResult, IndexError> {
+        let source = match name_hint {
+            Some(name) => CrateSource::zip_with_name(path.to_path_buf(), name),
+            None => CrateSource::zip(path.to_path_buf()),
+        };
+        self.add_from_source(&source)
     }
 }
 

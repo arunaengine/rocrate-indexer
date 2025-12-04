@@ -47,7 +47,7 @@ struct ApiDoc;
 
 #[derive(Debug, Deserialize, ToSchema)]
 struct AddCrateByUrlRequest {
-    /// URL to ro-crate-metadata.json
+    /// URL to ro-crate-metadata.json or directory containing it
     url: String,
 }
 
@@ -202,6 +202,9 @@ async fn add_crate_by_url(
 }
 
 /// Add an RO-Crate by uploading a file (zip archive or ro-crate-metadata.json)
+///
+/// For zip files, the original filename is used as a hint for the crate ID.
+/// If no filename is provided, a ULID-only ID will be generated.
 #[utoipa::path(
     post,
     path = "/crates/upload",
@@ -209,7 +212,7 @@ async fn add_crate_by_url(
     request_body(
         content_type = "multipart/form-data",
         content = Vec<u8>,
-        description = "Upload a zip archive or ro-crate-metadata.json file"
+        description = "Upload a zip archive or ro-crate-metadata.json file. Field name must be 'file'."
     ),
     responses(
         (status = 201, description = "Crate added successfully", body = AddCrateResponse),
@@ -230,7 +233,12 @@ async fn add_crate_by_upload(
     };
 
     // Determine file type and process
-    let is_zip = filename.ends_with(".zip") || data.starts_with(&[0x50, 0x4B, 0x03, 0x04]); // ZIP magic bytes
+    let is_zip = filename.ends_with(".zip")
+        || filename.ends_with(".ZIP")
+        || data.starts_with(&[0x50, 0x4B, 0x03, 0x04]); // ZIP magic bytes
+
+    // Extract a clean name hint from the original filename
+    let name_hint = extract_name_hint(&filename);
 
     let result = tokio::task::spawn_blocking(move || {
         let mut idx = index.write().map_err(|e| format!("Lock error: {}", e))?;
@@ -242,7 +250,7 @@ async fn add_crate_by_upload(
             std::fs::write(&temp_path, &data)
                 .map_err(|e| format!("Failed to write temp file: {}", e))?;
 
-            let result = idx.add_from_source(&CrateSource::ZipFile(temp_path.clone()));
+            let result = idx.add_from_zip_with_name(&temp_path, name_hint.as_deref());
 
             // Clean up temp file
             let _ = std::fs::remove_file(&temp_path);
@@ -253,7 +261,7 @@ async fn add_crate_by_upload(
             let json_str =
                 String::from_utf8(data).map_err(|e| format!("Invalid UTF-8 in file: {}", e))?;
 
-            idx.add_from_json(&json_str, &filename)
+            idx.add_from_json(&json_str, name_hint.as_deref())
                 .map_err(|e| format!("Failed to add crate: {}", e))
         }
     })
@@ -275,6 +283,34 @@ async fn add_crate_by_upload(
             }),
         )
             .into_response(),
+    }
+}
+
+/// Extract a clean name hint from a filename
+fn extract_name_hint(filename: &str) -> Option<String> {
+    // Get the filename without path
+    let name = filename
+        .rsplit('/')
+        .next()
+        .or_else(|| filename.rsplit('\\').next())
+        .unwrap_or(filename);
+
+    // Skip generic/temp-looking names
+    if name.starts_with("rocrate_") || name == "upload.json" || name == "upload.zip" {
+        return None;
+    }
+
+    // Remove extension
+    let clean = name
+        .trim_end_matches(".zip")
+        .trim_end_matches(".ZIP")
+        .trim_end_matches(".json")
+        .trim_end_matches("-ro-crate-metadata");
+
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean.to_string())
     }
 }
 

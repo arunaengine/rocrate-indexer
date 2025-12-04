@@ -121,7 +121,8 @@ fn parse_source(source: &str) -> CrateSource {
         if path.is_dir() {
             CrateSource::Directory(path)
         } else {
-            CrateSource::ZipFile(path)
+            // Use the zip constructor which extracts name from path
+            CrateSource::zip(path)
         }
     }
 }

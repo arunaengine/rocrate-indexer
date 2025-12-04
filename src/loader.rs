@@ -14,11 +14,14 @@ use crate::error::IndexError;
 pub enum CrateSource {
     /// Local directory containing ro-crate-metadata.json
     Directory(PathBuf),
-    /// Local zip file
-    ZipFile(PathBuf),
+    /// Local zip file with optional name hint for ID generation
+    ZipFile {
+        path: PathBuf,
+        name_hint: Option<String>,
+    },
     /// Remote URL (may or may not end with ro-crate-metadata.json)
     Url(String),
-    /// Subcrate within a zip archive (parent_id, zip_path, subpath within zip)
+    /// Subcrate within a zip archive
     ZipSubcrate {
         parent_id: String,
         zip_path: PathBuf,
@@ -32,9 +35,25 @@ pub enum CrateSource {
 }
 
 impl CrateSource {
+    /// Create a ZipFile source from a path (no name hint)
+    pub fn zip(path: PathBuf) -> Self {
+        CrateSource::ZipFile {
+            path,
+            name_hint: None,
+        }
+    }
+
+    /// Create a ZipFile source with a name hint
+    pub fn zip_with_name(path: PathBuf, name: impl Into<String>) -> Self {
+        CrateSource::ZipFile {
+            path,
+            name_hint: Some(name.into()),
+        }
+    }
+
     /// Derive a crate identifier from the source
     /// - URLs: use the URL as-is
-    /// - Local paths: <ULID>/name
+    /// - Local paths: <ULID> or <ULID>/name if name available
     /// - Subcrates: inherit parent ID with subpath appended
     pub fn to_crate_id(&self) -> String {
         match self {
@@ -43,28 +62,37 @@ impl CrateSource {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
                 format!("{}/{}", Ulid::new(), name)
             }
-            CrateSource::ZipFile(p) => {
-                let name = p.file_stem().and_then(|n| n.to_str()).unwrap_or("unknown");
-                format!("{}/{}", Ulid::new(), name)
+            CrateSource::ZipFile { path, name_hint } => {
+                let ulid = Ulid::new();
+                match name_hint {
+                    Some(name) => {
+                        // Clean up the name - remove .zip extension if present
+                        let clean_name = name.trim_end_matches(".zip").trim_end_matches(".ZIP");
+                        format!("{}/{}", ulid, clean_name)
+                    }
+                    None => {
+                        // Try to get name from path, fall back to just ULID
+                        match path.file_stem().and_then(|n| n.to_str()) {
+                            Some(name) if !name.starts_with("rocrate_") && !is_uuid_like(name) => {
+                                format!("{}/{}", ulid, name)
+                            }
+                            _ => ulid.to_string(),
+                        }
+                    }
+                }
             }
             CrateSource::ZipSubcrate {
                 parent_id, subpath, ..
             } => {
-                // Append subpath to parent ID
-                let clean_subpath = subpath
-                    .trim_matches('/')
-                    .trim_end_matches("/ro-crate-metadata.json");
-                // Remove any *-ro-crate-metadata.json suffix
-                let clean_subpath = clean_subpath
-                    .rsplit_once('/')
-                    .map(|(path, _)| path)
-                    .unwrap_or(clean_subpath);
-                format!("{}/{}", parent_id, clean_subpath)
+                // Extract directory path from subpath, removing the metadata filename
+                let clean_subpath = extract_directory_from_metadata_path(subpath);
+                if clean_subpath.is_empty() {
+                    parent_id.clone()
+                } else {
+                    format!("{}/{}", parent_id, clean_subpath)
+                }
             }
-            CrateSource::UrlSubcrate { metadata_url, .. } => {
-                // For URL subcrates, use the metadata URL as the ID
-                normalize_url_for_id(metadata_url)
-            }
+            CrateSource::UrlSubcrate { metadata_url, .. } => normalize_url_for_id(metadata_url),
         }
     }
 
@@ -94,17 +122,38 @@ impl CrateSource {
     pub fn is_local(&self) -> bool {
         matches!(
             self,
-            CrateSource::Directory(_) | CrateSource::ZipFile(_) | CrateSource::ZipSubcrate { .. }
+            CrateSource::Directory(_)
+                | CrateSource::ZipFile { .. }
+                | CrateSource::ZipSubcrate { .. }
         )
     }
 
     /// Get the zip path if this is a zip-based source
     pub fn zip_path(&self) -> Option<&PathBuf> {
         match self {
-            CrateSource::ZipFile(p) => Some(p),
+            CrateSource::ZipFile { path, .. } => Some(path),
             CrateSource::ZipSubcrate { zip_path, .. } => Some(zip_path),
             _ => None,
         }
+    }
+}
+
+/// Check if a string looks like a UUID (for filtering temp filenames)
+fn is_uuid_like(s: &str) -> bool {
+    // UUIDs are 36 chars with hyphens, or 32 without
+    let without_hyphens: String = s.chars().filter(|c| *c != '-').collect();
+    without_hyphens.len() == 32 && without_hyphens.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Extract the directory path from a metadata file path
+/// e.g., "subdir/ro-crate-metadata.json" -> "subdir"
+/// e.g., "subdir/prefix-ro-crate-metadata.json" -> "subdir"
+/// e.g., "ro-crate-metadata.json" -> ""
+fn extract_directory_from_metadata_path(path: &str) -> String {
+    if let Some(pos) = path.rfind('/') {
+        path[..pos].trim_matches('/').to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -113,7 +162,6 @@ impl CrateSource {
 fn normalize_url_for_id(url: &str) -> String {
     let url = url.trim_end_matches('/');
     if url.ends_with("ro-crate-metadata.json") {
-        // Find the last path segment
         if let Some(pos) = url.rfind('/') {
             return url[..pos].to_string();
         }
@@ -133,8 +181,9 @@ pub fn load_from_directory(path: &PathBuf) -> Result<RoCrate, IndexError> {
     })
 }
 
-/// Load an RO-Crate from a zip file by extracting ro-crate-metadata.json
-pub fn load_from_zip(path: &PathBuf) -> Result<(RoCrate, String), IndexError> {
+/// Load an RO-Crate from a zip file by extracting the root ro-crate-metadata.json
+/// Returns (crate_data, json_content, root_prefix)
+pub fn load_from_zip(path: &PathBuf) -> Result<(RoCrate, String, String), IndexError> {
     if !path.exists() {
         return Err(IndexError::InvalidPath(path.to_path_buf()));
     }
@@ -149,9 +198,12 @@ pub fn load_from_zip(path: &PathBuf) -> Result<(RoCrate, String), IndexError> {
         reason: format!("Failed to read zip archive: {}", e),
     })?;
 
-    // Look for ro-crate-metadata.json at root
-    let metadata_filename = find_root_metadata_in_zip(&mut archive)?;
-    load_metadata_from_zip(&mut archive, &metadata_filename, path)
+    // Find the root metadata file (must be at top level)
+    let (metadata_filename, root_prefix) = find_root_metadata_in_zip(&mut archive)?;
+    let (crate_data, content) =
+        load_metadata_from_zip_archive(&mut archive, &metadata_filename, path)?;
+
+    Ok((crate_data, content, root_prefix))
 }
 
 /// Load a subcrate from within a zip archive
@@ -169,11 +221,11 @@ pub fn load_from_zip_subpath(
         reason: format!("Failed to read zip archive: {}", e),
     })?;
 
-    load_metadata_from_zip(&mut archive, subpath, zip_path)
+    load_metadata_from_zip_archive(&mut archive, subpath, zip_path)
 }
 
 /// Load metadata content from a zip archive entry
-fn load_metadata_from_zip(
+fn load_metadata_from_zip_archive(
     archive: &mut ZipArchive<File>,
     entry_path: &str,
     zip_path: &PathBuf,
@@ -201,36 +253,62 @@ fn load_metadata_from_zip(
     Ok((crate_data, content))
 }
 
-/// Find ro-crate-metadata.json at the root of a zip archive
+/// Find the root ro-crate-metadata.json in a zip archive
+/// Returns (full_path, root_prefix) where root_prefix is the top-level directory if any
 fn find_root_metadata_in_zip<R: Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
-) -> Result<String, IndexError> {
+) -> Result<(String, String), IndexError> {
+    // Collect all entries
+    let mut entries: Vec<String> = Vec::new();
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i) {
-            let name = file.name();
-            // Root level only: no directory separators before the filename
-            if !name.contains('/') && name.ends_with("ro-crate-metadata.json") {
-                return Ok(name.to_string());
-            }
-            // Or single top-level directory (common when zipping a folder)
-            let parts: Vec<&str> = name.split('/').collect();
-            if parts.len() == 2 && parts[1].ends_with("ro-crate-metadata.json") {
-                return Ok(name.to_string());
+            entries.push(file.name().to_string());
+        }
+    }
+
+    // First, check for metadata directly at root (no directory)
+    for entry in &entries {
+        if !entry.contains('/') && entry.ends_with("ro-crate-metadata.json") {
+            return Ok((entry.clone(), String::new()));
+        }
+    }
+
+    // Find the common top-level directory (if archive was created by zipping a folder)
+    // This is the case when ALL entries start with the same directory prefix
+    let top_level_dirs: std::collections::HashSet<_> = entries
+        .iter()
+        .filter_map(|e| e.split('/').next())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if top_level_dirs.len() == 1 {
+        let prefix = top_level_dirs.into_iter().next().unwrap();
+        // Look for metadata in this single top-level directory
+        let expected_root = format!("{}/", prefix);
+        for entry in &entries {
+            if entry.starts_with(&expected_root) {
+                let remainder = &entry[expected_root.len()..];
+                // Must be directly in the top-level dir, not a subdirectory
+                if !remainder.contains('/') && remainder.ends_with("ro-crate-metadata.json") {
+                    return Ok((entry.clone(), prefix.to_string()));
+                }
             }
         }
     }
 
+    // If we have multiple top-level items, the root metadata must be at the actual root
     Err(IndexError::LoadError {
         path: "zip".to_string(),
-        reason: "No ro-crate-metadata.json found at archive root".to_string(),
+        reason: "No root ro-crate-metadata.json found at archive root".to_string(),
     })
 }
 
-/// Scan a zip archive for all potential subcrate metadata files
-/// Returns a list of (entity_id, metadata_path) pairs for entities that have metadata in the archive
+/// Find metadata files for specific subcrate entity IDs in a zip archive
+/// Only returns matches for the given entity IDs (based on the parent's @graph)
 pub fn find_subcrate_metadata_in_zip(
     zip_path: &PathBuf,
     entity_ids: &[String],
+    root_prefix: &str,
 ) -> Result<Vec<(String, String)>, IndexError> {
     let file = File::open(zip_path).map_err(|e| IndexError::LoadError {
         path: zip_path.display().to_string(),
@@ -242,7 +320,7 @@ pub fn find_subcrate_metadata_in_zip(
         reason: format!("Failed to read zip archive: {}", e),
     })?;
 
-    // Collect all entries ending with ro-crate-metadata.json
+    // Collect all metadata entries (excluding root)
     let mut metadata_entries: Vec<String> = Vec::new();
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i) {
@@ -259,13 +337,18 @@ pub fn find_subcrate_metadata_in_zip(
         // Normalize entity ID: remove leading ./ and trailing /
         let normalized = entity_id.trim_start_matches("./").trim_end_matches('/');
 
+        // Build expected path prefix (accounting for root_prefix)
+        let expected_dir = if root_prefix.is_empty() {
+            normalized.to_string()
+        } else {
+            format!("{}/{}", root_prefix, normalized)
+        };
+
         // Look for metadata file in this directory
         for entry in &metadata_entries {
-            let entry_dir = entry.trim_end_matches(|c| c != '/').trim_end_matches('/');
+            let entry_dir = extract_directory_from_metadata_path(entry);
 
-            // Check if entry is in the entity's directory
-            // Entry could be "subdir/ro-crate-metadata.json" or "subdir/prefix-ro-crate-metadata.json"
-            if entry_dir == normalized || entry_dir.ends_with(&format!("/{}", normalized)) {
+            if entry_dir == expected_dir {
                 matches.push((entity_id.clone(), entry.clone()));
                 break; // Take first match for this entity
             }
@@ -373,22 +456,34 @@ fn find_metadata_in_directory(path: &PathBuf) -> Result<PathBuf, IndexError> {
     })
 }
 
-/// Load from any source, returning both crate and raw JSON
-pub fn load_with_json(source: &CrateSource) -> Result<(RoCrate, String), IndexError> {
+/// Load from any source, returning crate, JSON, and optional root prefix (for zips)
+pub fn load_with_json(source: &CrateSource) -> Result<(RoCrate, String, String), IndexError> {
     match source {
-        CrateSource::Directory(p) => load_from_directory_with_json(p),
-        CrateSource::ZipFile(p) => load_from_zip(p),
-        CrateSource::Url(u) => load_from_url(u),
+        CrateSource::Directory(p) => {
+            let (crate_data, json) = load_from_directory_with_json(p)?;
+            Ok((crate_data, json, String::new()))
+        }
+        CrateSource::ZipFile { path, .. } => load_from_zip(path),
+        CrateSource::Url(u) => {
+            let (crate_data, json) = load_from_url(u)?;
+            Ok((crate_data, json, String::new()))
+        }
         CrateSource::ZipSubcrate {
             zip_path, subpath, ..
-        } => load_from_zip_subpath(zip_path, subpath),
-        CrateSource::UrlSubcrate { metadata_url, .. } => load_from_url(metadata_url),
+        } => {
+            let (crate_data, json) = load_from_zip_subpath(zip_path, subpath)?;
+            Ok((crate_data, json, String::new()))
+        }
+        CrateSource::UrlSubcrate { metadata_url, .. } => {
+            let (crate_data, json) = load_from_url(metadata_url)?;
+            Ok((crate_data, json, String::new()))
+        }
     }
 }
 
 /// Load from any source (backward compatibility)
 pub fn load(source: &CrateSource) -> Result<RoCrate, IndexError> {
-    load_with_json(source).map(|(crate_data, _)| crate_data)
+    load_with_json(source).map(|(crate_data, _, _)| crate_data)
 }
 
 #[cfg(test)]
@@ -432,5 +527,50 @@ mod tests {
             subcrate.to_crate_id(),
             "01ARZ3NDEKTSV4RRFFQ69G5FAV/mydata/experiments"
         );
+    }
+
+    #[test]
+    fn test_is_uuid_like() {
+        assert!(is_uuid_like("626a838e-398d-4010-8c57-92c5cea1798c"));
+        assert!(is_uuid_like("626a838e398d401c8c5792c5cea1798c"));
+        assert!(!is_uuid_like("mydata"));
+        assert!(!is_uuid_like("rocrate_test"));
+    }
+
+    #[test]
+    fn test_extract_directory_from_metadata_path() {
+        assert_eq!(
+            extract_directory_from_metadata_path("subdir/ro-crate-metadata.json"),
+            "subdir"
+        );
+        assert_eq!(
+            extract_directory_from_metadata_path("a/b/ro-crate-metadata.json"),
+            "a/b"
+        );
+        assert_eq!(
+            extract_directory_from_metadata_path("ro-crate-metadata.json"),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_zip_with_name_hint() {
+        let source = CrateSource::zip_with_name(PathBuf::from("/tmp/test.zip"), "mydata.zip");
+        let id = source.to_crate_id();
+        // Should be ULID/mydata (without .zip)
+        assert!(id.ends_with("/mydata"));
+        assert!(!id.ends_with(".zip"));
+    }
+
+    #[test]
+    fn test_zip_without_name_hint_uuid_path() {
+        let source = CrateSource::ZipFile {
+            path: PathBuf::from("/tmp/rocrate_626a838e-398d-4010-8c57-92c5cea1798c.zip"),
+            name_hint: None,
+        };
+        let id = source.to_crate_id();
+        // Should be just ULID (no /rocrate_uuid suffix)
+        assert!(!id.contains('/'));
+        assert!(!id.contains("rocrate_"));
     }
 }
