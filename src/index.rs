@@ -33,7 +33,7 @@ impl SearchIndex {
         let schema = Self::build_schema();
 
         let index = if path.exists() {
-            println!("Opening existing index at {:?}", path);
+            //println!("Opening existing index at {:?}", path);
             Index::open_in_dir(path)?
         } else {
             std::fs::create_dir_all(path)?;
