@@ -14,7 +14,7 @@ const TEXT_FIELDS: &[&str] = &[
 const PERSON_FIELDS: &[&str] = &["author", "creator", "contributor", "publisher"];
 
 /// RO-Crate conformsTo URL prefix
-const ROCRATE_PROFILE_PREFIX: &str = "https://w3id.org/ro/crate/";
+const ROCRATE_PROFILE_PREFIX: &str = "https://w3id.org/ro/crate";
 
 /// Information about a discovered subcrate
 #[derive(Debug, Clone)]

@@ -199,6 +199,7 @@ fn collect_subcrates(results: &[rocrate_indexer::AddResult], out: &mut Vec<Crate
     responses(
         (status = 201, description = "Crate added successfully", body = AddCrateResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 409, description = "Crate already indexed", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
@@ -206,7 +207,33 @@ async fn add_crate_by_url(
     State(index): State<SharedCrateIndex>,
     Json(req): Json<AddCrateByUrlRequest>,
 ) -> impl IntoResponse {
-    let source = CrateSource::Url(req.url);
+    let source = CrateSource::Url(req.url.clone());
+    let crate_id = source.to_crate_id();
+
+    // Check if already indexed
+    {
+        let idx = match index.read() {
+            Ok(idx) => idx,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Lock error: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        if idx.is_indexed(&crate_id) {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!("Crate already indexed: {}", crate_id),
+                }),
+            )
+                .into_response();
+        }
+    }
 
     let result = tokio::task::spawn_blocking(move || {
         let mut idx = index.write().map_err(|e| format!("Lock error: {}", e))?;
