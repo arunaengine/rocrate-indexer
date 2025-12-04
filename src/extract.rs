@@ -21,8 +21,10 @@ const ROCRATE_PROFILE_PREFIX: &str = "https://w3id.org/ro/crate/";
 pub struct SubcrateInfo {
     /// The @id of the subcrate entity
     pub entity_id: String,
-    /// The URL to the subcrate's metadata file (from subjectOf)
+    /// The resolved URL/path to the subcrate's metadata file
     pub metadata_url: String,
+    /// Whether this is a relative path (for zip extraction) or absolute URL
+    pub is_relative: bool,
 }
 
 /// Extract full-text searchable content from a JSON-LD entity
@@ -92,7 +94,7 @@ pub fn extract_id(entity: &Value) -> Option<&str> {
 }
 
 /// Check if an entity conforms to the RO-Crate specification
-fn conforms_to_rocrate(entity: &Value) -> bool {
+pub fn conforms_to_rocrate(entity: &Value) -> bool {
     let conforms_to = match entity.get("conformsTo") {
         Some(v) => v,
         None => return false,
@@ -141,9 +143,34 @@ fn extract_subject_of_url(entity: &Value) -> Option<String> {
     }
 }
 
-/// Detect subcrates in a list of entities
-/// Returns information needed to fetch each subcrate
-pub fn detect_subcrates(entities: &[Value], base_url: Option<&str>) -> Vec<SubcrateInfo> {
+/// Find all Dataset entities that conform to RO-Crate (potential subcrates)
+/// Returns entity IDs for further processing
+pub fn find_potential_subcrates(entities: &[Value]) -> Vec<String> {
+    let mut subcrate_ids = Vec::new();
+
+    for entity in entities {
+        // Must be a Dataset
+        let types = extract_types(entity);
+        if !types.iter().any(|t| t == "Dataset") {
+            continue;
+        }
+
+        // Must conform to RO-Crate spec
+        if !conforms_to_rocrate(entity) {
+            continue;
+        }
+
+        if let Some(id) = extract_id(entity) {
+            subcrate_ids.push(id.to_string());
+        }
+    }
+
+    subcrate_ids
+}
+
+/// Detect subcrates from URL-based crates
+/// Uses subjectOf if available, otherwise defaults to <id>/ro-crate-metadata.json
+pub fn detect_subcrates_from_url(entities: &[Value], base_url: Option<&str>) -> Vec<SubcrateInfo> {
     let mut subcrates = Vec::new();
 
     for entity in entities {
@@ -158,27 +185,44 @@ pub fn detect_subcrates(entities: &[Value], base_url: Option<&str>) -> Vec<Subcr
             continue;
         }
 
-        // Must have subjectOf pointing to metadata
-        let metadata_url = match extract_subject_of_url(entity) {
-            Some(url) => url,
-            None => continue,
-        };
-
         let entity_id = match extract_id(entity) {
             Some(id) => id.to_string(),
             None => continue,
         };
 
-        // Resolve relative URL against base
-        let resolved_url = resolve_url(&metadata_url, base_url);
+        // Try to get metadata URL from subjectOf
+        let metadata_url = if let Some(subject_of) = extract_subject_of_url(entity) {
+            subject_of
+        } else {
+            // Default to <id>/ro-crate-metadata.json
+            let id_normalized = entity_id.trim_end_matches('/');
+            format!("{}/ro-crate-metadata.json", id_normalized)
+        };
+
+        // Check if it's already absolute or needs resolution
+        let is_relative =
+            !metadata_url.starts_with("http://") && !metadata_url.starts_with("https://");
+
+        let resolved_url = if is_relative {
+            resolve_url(&metadata_url, base_url)
+        } else {
+            metadata_url.clone()
+        };
 
         subcrates.push(SubcrateInfo {
             entity_id,
             metadata_url: resolved_url,
+            is_relative,
         });
     }
 
     subcrates
+}
+
+/// Detect subcrates for local/zip sources
+/// Returns entity IDs that should be checked against the zip contents
+pub fn get_subcrate_entity_ids(entities: &[Value]) -> Vec<String> {
+    find_potential_subcrates(entities)
 }
 
 /// Resolve a potentially relative URL against a base URL
@@ -291,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_subcrates() {
+    fn test_detect_subcrates_with_subject_of() {
         let entities = vec![
             serde_json::json!({
                 "@id": "https://example.org/subcrate/",
@@ -305,13 +349,58 @@ mod tests {
             }),
         ];
 
-        let subcrates = detect_subcrates(&entities, None);
+        let subcrates = detect_subcrates_from_url(&entities, None);
         assert_eq!(subcrates.len(), 1);
         assert_eq!(subcrates[0].entity_id, "https://example.org/subcrate/");
         assert_eq!(
             subcrates[0].metadata_url,
             "https://example.org/subcrate/ro-crate-metadata.json"
         );
+    }
+
+    #[test]
+    fn test_detect_subcrates_without_subject_of() {
+        let entities = vec![serde_json::json!({
+            "@id": "./experiments/",
+            "@type": "Dataset",
+            "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+        })];
+
+        let base_url = Some("https://example.org/parent");
+        let subcrates = detect_subcrates_from_url(&entities, base_url);
+
+        assert_eq!(subcrates.len(), 1);
+        assert_eq!(subcrates[0].entity_id, "./experiments/");
+        assert_eq!(
+            subcrates[0].metadata_url,
+            "https://example.org/parent/experiments/ro-crate-metadata.json"
+        );
+    }
+
+    #[test]
+    fn test_find_potential_subcrates() {
+        let entities = vec![
+            serde_json::json!({
+                "@id": "./experiments/",
+                "@type": "Dataset",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+            }),
+            serde_json::json!({
+                "@id": "./data/",
+                "@type": "Dataset",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}
+            }),
+            serde_json::json!({
+                "@id": "./regular/",
+                "@type": "Dataset"
+                // No conformsTo - not a subcrate
+            }),
+        ];
+
+        let ids = find_potential_subcrates(&entities);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"./experiments/".to_string()));
+        assert!(ids.contains(&"./data/".to_string()));
     }
 
     #[test]

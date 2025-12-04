@@ -14,8 +14,9 @@ use rocraters::ro_crate::rocrate::RoCrate;
 
 use crate::config::Config;
 use crate::error::IndexError;
-use crate::extract::detect_subcrates;
+use crate::extract::{detect_subcrates_from_url, get_subcrate_entity_ids};
 use crate::index::SearchIndex;
+use crate::loader::find_subcrate_metadata_in_zip;
 use crate::query::QueryEngine;
 use crate::store::CrateStore;
 
@@ -121,9 +122,24 @@ impl CrateIndex {
         Arc::new(RwLock::new(self))
     }
 
+    /// Check if a crate ID is already indexed (cycle detection)
+    pub fn is_indexed(&self, crate_id: &str) -> bool {
+        self.manifest.contains(crate_id)
+    }
+
     /// Add a crate from a source (path, zip, url) with automatic subcrate discovery
     pub fn add_from_source(&mut self, source: &CrateSource) -> Result<AddResult, IndexError> {
         let crate_id = source.to_crate_id();
+
+        // Cycle detection: skip if already indexed
+        if self.is_indexed(&crate_id) {
+            return Ok(AddResult {
+                crate_id,
+                entity_count: 0,
+                subcrates: Vec::new(),
+            });
+        }
+
         let (crate_data, raw_json) = loader::load_with_json(source)?;
 
         // Save metadata to disk
@@ -132,10 +148,6 @@ impl CrateIndex {
 
         // Convert to JSON for indexing and subcrate detection
         let entities = self.graph_to_json(&crate_data)?;
-
-        // Detect subcrates before indexing
-        let base_url = source.base_url();
-        let subcrate_infos = detect_subcrates(&entities, base_url.as_deref());
 
         // Index the parent crate
         let entity_count = self.index_crate(&crate_id, &entities)?;
@@ -147,8 +159,8 @@ impl CrateIndex {
         self.manifest.add_crate(crate_id.clone());
         self.config.save_manifest(&self.manifest)?;
 
-        // Recursively add subcrates
-        let subcrates = self.add_subcrates(subcrate_infos)?;
+        // Discover and add subcrates based on source type
+        let subcrates = self.discover_and_add_subcrates(source, &crate_id, &entities)?;
 
         Ok(AddResult {
             crate_id,
@@ -157,26 +169,204 @@ impl CrateIndex {
         })
     }
 
-    /// Add discovered subcrates recursively
-    fn add_subcrates(
+    /// Discover and add subcrates based on the source type
+    fn discover_and_add_subcrates(
         &mut self,
+        source: &CrateSource,
+        parent_id: &str,
+        entities: &[serde_json::Value],
+    ) -> Result<Vec<AddResult>, IndexError> {
+        match source {
+            CrateSource::Url(_) | CrateSource::UrlSubcrate { .. } => {
+                // For URL sources, use subjectOf or default metadata path
+                let base_url = source.base_url();
+                let subcrate_infos = detect_subcrates_from_url(entities, base_url.as_deref());
+                self.add_url_subcrates(parent_id, subcrate_infos)
+            }
+            CrateSource::ZipFile(zip_path) | CrateSource::ZipSubcrate { zip_path, .. } => {
+                // For zip sources, scan the archive for metadata files
+                self.add_zip_subcrates(parent_id, zip_path, entities)
+            }
+            CrateSource::Directory(dir_path) => {
+                // For directory sources, look for subdirectories with metadata
+                self.add_directory_subcrates(parent_id, dir_path, entities)
+            }
+        }
+    }
+
+    /// Add subcrates discovered from URL-based sources
+    fn add_url_subcrates(
+        &mut self,
+        parent_id: &str,
         subcrates: Vec<SubcrateInfo>,
     ) -> Result<Vec<AddResult>, IndexError> {
         let mut results = Vec::new();
 
         for info in subcrates {
-            // Skip if already indexed
-            if self.manifest.contains(&info.metadata_url) {
+            // Check if it's a relative path that should be an absolute URL
+            let source = if info.metadata_url.starts_with("http://")
+                || info.metadata_url.starts_with("https://")
+            {
+                // Absolute URL - could be external or same-origin subcrate
+                CrateSource::UrlSubcrate {
+                    parent_id: parent_id.to_string(),
+                    metadata_url: info.metadata_url,
+                }
+            } else {
+                // Relative path - this shouldn't happen for URL sources after resolution
+                // but handle it just in case
+                continue;
+            };
+
+            // Skip if already indexed (cycle detection)
+            let subcrate_id = source.to_crate_id();
+            if self.is_indexed(&subcrate_id) {
                 continue;
             }
 
-            // Fetch and add the subcrate
-            let source = CrateSource::Url(info.metadata_url);
-            let result = self.add_from_source(&source)?;
-            results.push(result);
+            match self.add_from_source(&source) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    // Log but don't fail - subcrate might not be accessible
+                    eprintln!("Warning: Failed to add subcrate {}: {}", info.entity_id, e);
+                }
+            }
         }
 
         Ok(results)
+    }
+
+    /// Add subcrates from within a zip archive
+    fn add_zip_subcrates(
+        &mut self,
+        parent_id: &str,
+        zip_path: &std::path::PathBuf,
+        entities: &[serde_json::Value],
+    ) -> Result<Vec<AddResult>, IndexError> {
+        // Get potential subcrate entity IDs
+        let entity_ids = get_subcrate_entity_ids(entities);
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Check for URL subcrates first (external references from zip)
+        let base_url = None; // Zips don't have base URLs
+        let url_subcrates: Vec<_> = detect_subcrates_from_url(entities, base_url)
+            .into_iter()
+            .filter(|s| !s.is_relative)
+            .collect();
+
+        // Add URL subcrates
+        let mut results = self.add_url_subcrates(parent_id, url_subcrates)?;
+
+        // Find matching metadata files in the zip
+        let zip_matches = find_subcrate_metadata_in_zip(zip_path, &entity_ids)?;
+
+        for (entity_id, metadata_path) in zip_matches {
+            let source = CrateSource::ZipSubcrate {
+                parent_id: parent_id.to_string(),
+                zip_path: zip_path.clone(),
+                subpath: metadata_path,
+            };
+
+            // Skip if already indexed
+            let subcrate_id = source.to_crate_id();
+            if self.is_indexed(&subcrate_id) {
+                continue;
+            }
+
+            match self.add_from_source(&source) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    eprintln!("Warning: Failed to add zip subcrate {}: {}", entity_id, e);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Add subcrates from subdirectories
+    fn add_directory_subcrates(
+        &mut self,
+        parent_id: &str,
+        dir_path: &std::path::PathBuf,
+        entities: &[serde_json::Value],
+    ) -> Result<Vec<AddResult>, IndexError> {
+        let entity_ids = get_subcrate_entity_ids(entities);
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+
+        for entity_id in entity_ids {
+            // Normalize path
+            let subpath = entity_id.trim_start_matches("./").trim_end_matches('/');
+            let subdir = dir_path.join(subpath);
+
+            if !subdir.is_dir() {
+                continue;
+            }
+
+            // Look for metadata file in subdirectory
+            let has_metadata = find_metadata_in_dir(&subdir);
+            if !has_metadata {
+                continue;
+            }
+
+            // Create a unique ID inheriting from parent
+            let subcrate_id = format!("{}/{}", parent_id, subpath);
+
+            // Skip if already indexed
+            if self.is_indexed(&subcrate_id) {
+                continue;
+            }
+
+            // We need to load and index manually to preserve the ID
+            match self.add_directory_subcrate(&subcrate_id, &subdir) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to add directory subcrate {}: {}",
+                        entity_id, e
+                    );
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Add a directory subcrate with a specific ID
+    fn add_directory_subcrate(
+        &mut self,
+        crate_id: &str,
+        dir_path: &std::path::PathBuf,
+    ) -> Result<AddResult, IndexError> {
+        let (crate_data, raw_json) = loader::load_from_directory_with_json(dir_path)?;
+
+        // Save metadata
+        let metadata_path = self.config.metadata_path_for_crate(crate_id);
+        std::fs::write(&metadata_path, &raw_json)?;
+
+        // Convert and index
+        let entities = self.graph_to_json(&crate_data)?;
+        let entity_count = self.index_crate(crate_id, &entities)?;
+
+        // Store
+        self.store.insert(crate_id.to_string(), crate_data);
+        self.manifest.add_crate(crate_id.to_string());
+        self.config.save_manifest(&self.manifest)?;
+
+        // Recursive subcrate discovery
+        let subcrates = self.add_directory_subcrates(crate_id, dir_path, &entities)?;
+
+        Ok(AddResult {
+            crate_id: crate_id.to_string(),
+            entity_count,
+            subcrates,
+        })
     }
 
     /// Index entities for a crate
@@ -338,18 +528,24 @@ impl CrateIndex {
             }
         })?;
 
-        // Generate a crate ID
-        let crate_id = format!("{}-{}", uuid::Uuid::new_v4(), name_hint);
+        // Generate a crate ID using ULID
+        let crate_id = format!("{}/{}", ulid::Ulid::new(), name_hint);
+
+        // Cycle detection
+        if self.is_indexed(&crate_id) {
+            return Ok(AddResult {
+                crate_id,
+                entity_count: 0,
+                subcrates: Vec::new(),
+            });
+        }
 
         // Save metadata to disk
         let metadata_path = self.config.metadata_path_for_crate(&crate_id);
         std::fs::write(&metadata_path, json_str)?;
 
-        // Convert to JSON for indexing and subcrate detection
+        // Convert to JSON for indexing
         let entities = self.graph_to_json(&crate_data)?;
-
-        // Detect subcrates (no base URL for uploaded files)
-        let subcrate_infos = detect_subcrates(&entities, None);
 
         // Index the crate
         let entity_count = self.index_crate(&crate_id, &entities)?;
@@ -361,8 +557,12 @@ impl CrateIndex {
         self.manifest.add_crate(crate_id.clone());
         self.config.save_manifest(&self.manifest)?;
 
-        // Recursively add subcrates
-        let subcrates = self.add_subcrates(subcrate_infos)?;
+        // For JSON uploads, check for URL subcrates only (no local file access)
+        let url_subcrates: Vec<_> = detect_subcrates_from_url(&entities, None)
+            .into_iter()
+            .filter(|s| !s.is_relative)
+            .collect();
+        let subcrates = self.add_url_subcrates(&crate_id, url_subcrates)?;
 
         Ok(AddResult {
             crate_id,
@@ -370,6 +570,26 @@ impl CrateIndex {
             subcrates,
         })
     }
+}
+
+/// Check if a directory contains a metadata file
+fn find_metadata_in_dir(dir: &std::path::Path) -> bool {
+    if dir.join("ro-crate-metadata.json").exists() {
+        return true;
+    }
+
+    // Look for *-ro-crate-metadata.json
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with("-ro-crate-metadata.json") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -390,5 +610,11 @@ mod tests {
             let guard = index.read().unwrap();
             assert_eq!(guard.crate_count(), 0);
         }
+    }
+
+    #[test]
+    fn test_cycle_detection() {
+        let index = CrateIndex::new_in_memory().unwrap();
+        assert!(!index.is_indexed("test-crate"));
     }
 }
