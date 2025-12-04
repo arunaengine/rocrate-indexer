@@ -1,7 +1,10 @@
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 
 use rocraters::ro_crate::read::read_crate;
 use uuid::Uuid;
+use zip::ZipArchive;
 
 use crate::error::IndexError;
 
@@ -50,8 +53,10 @@ impl CrateSource {
     }
 }
 
-/// Load an RO-Crate from a local path (directory or zip)
-pub fn load_from_path(path: &PathBuf) -> Result<rocraters::ro_crate::rocrate::RoCrate, IndexError> {
+/// Load an RO-Crate from a local directory
+pub fn load_from_directory(
+    path: &PathBuf,
+) -> Result<rocraters::ro_crate::rocrate::RoCrate, IndexError> {
     if !path.exists() {
         return Err(IndexError::InvalidPath(path.to_path_buf()));
     }
@@ -59,6 +64,83 @@ pub fn load_from_path(path: &PathBuf) -> Result<rocraters::ro_crate::rocrate::Ro
     read_crate(path, 0).map_err(|e| IndexError::LoadError {
         path: path.display().to_string(),
         reason: format!("{:#?}", e),
+    })
+}
+
+/// Load an RO-Crate from a zip file by extracting ro-crate-metadata.json
+pub fn load_from_zip(
+    path: &PathBuf,
+) -> Result<(rocraters::ro_crate::rocrate::RoCrate, String), IndexError> {
+    if !path.exists() {
+        return Err(IndexError::InvalidPath(path.to_path_buf()));
+    }
+
+    let file = File::open(path).map_err(|e| IndexError::LoadError {
+        path: path.display().to_string(),
+        reason: format!("Failed to open zip file: {}", e),
+    })?;
+
+    let mut archive = ZipArchive::new(file).map_err(|e| IndexError::LoadError {
+        path: path.display().to_string(),
+        reason: format!("Failed to read zip archive: {}", e),
+    })?;
+
+    // Look for ro-crate-metadata.json (could be at root or in a subdirectory)
+    let metadata_filename = find_metadata_in_zip(&mut archive)?;
+
+    let mut metadata_file =
+        archive
+            .by_name(&metadata_filename)
+            .map_err(|e| IndexError::LoadError {
+                path: path.display().to_string(),
+                reason: format!("Failed to extract {}: {}", metadata_filename, e),
+            })?;
+
+    let mut content = String::new();
+    metadata_file
+        .read_to_string(&mut content)
+        .map_err(|e| IndexError::LoadError {
+            path: path.display().to_string(),
+            reason: format!("Failed to read metadata file: {}", e),
+        })?;
+
+    let crate_data = rocraters::ro_crate::read::read_crate_obj(&content, 0).map_err(|e| {
+        IndexError::LoadError {
+            path: path.display().to_string(),
+            reason: format!("Failed to parse RO-Crate metadata: {:#?}", e),
+        }
+    })?;
+
+    Ok((crate_data, content))
+}
+
+/// Find ro-crate-metadata.json in a zip archive
+fn find_metadata_in_zip<R: Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+) -> Result<String, IndexError> {
+    // First try exact match at root
+    for i in 0..archive.len() {
+        if let Ok(file) = archive.by_index(i) {
+            let name = file.name();
+            if name == "ro-crate-metadata.json" {
+                return Ok(name.to_string());
+            }
+        }
+    }
+
+    // Then try to find it anywhere in the archive
+    for i in 0..archive.len() {
+        if let Ok(file) = archive.by_index(i) {
+            let name = file.name();
+            if name.ends_with("ro-crate-metadata.json") {
+                return Ok(name.to_string());
+            }
+        }
+    }
+
+    Err(IndexError::LoadError {
+        path: "zip".to_string(),
+        reason: "No ro-crate-metadata.json found in archive".to_string(),
     })
 }
 
@@ -87,21 +169,13 @@ pub fn load_from_url(
     Ok((crate_data, content))
 }
 
-/// Load from a path and return both the crate and raw JSON
-pub fn load_from_path_with_json(
+/// Load from a directory and return both the crate and raw JSON
+pub fn load_from_directory_with_json(
     path: &PathBuf,
 ) -> Result<(rocraters::ro_crate::rocrate::RoCrate, String), IndexError> {
-    let crate_data = load_from_path(path)?;
+    let crate_data = load_from_directory(path)?;
 
-    // Read the metadata JSON
-    let metadata_path = if path.is_dir() {
-        path.join("ro-crate-metadata.json")
-    } else {
-        // For zip files, serialize the loaded crate back to JSON
-        let json = serde_json::to_string_pretty(&crate_data)?;
-        return Ok((crate_data, json));
-    };
-
+    let metadata_path = path.join("ro-crate-metadata.json");
     let content = std::fs::read_to_string(&metadata_path).map_err(|e| IndexError::LoadError {
         path: metadata_path.display().to_string(),
         reason: e.to_string(),
@@ -115,7 +189,8 @@ pub fn load_with_json(
     source: &CrateSource,
 ) -> Result<(rocraters::ro_crate::rocrate::RoCrate, String), IndexError> {
     match source {
-        CrateSource::Directory(p) | CrateSource::ZipFile(p) => load_from_path_with_json(p),
+        CrateSource::Directory(p) => load_from_directory_with_json(p),
+        CrateSource::ZipFile(p) => load_from_zip(p),
         CrateSource::Url(u) => load_from_url(u),
     }
 }
@@ -123,7 +198,8 @@ pub fn load_with_json(
 /// Load from any source (backward compatibility)
 pub fn load(source: &CrateSource) -> Result<rocraters::ro_crate::rocrate::RoCrate, IndexError> {
     match source {
-        CrateSource::Directory(p) | CrateSource::ZipFile(p) => load_from_path(p),
+        CrateSource::Directory(p) => load_from_directory(p),
+        CrateSource::ZipFile(p) => load_from_zip(p).map(|(crate_data, _)| crate_data),
         CrateSource::Url(u) => load_from_url(u).map(|(crate_data, _)| crate_data),
     }
 }
