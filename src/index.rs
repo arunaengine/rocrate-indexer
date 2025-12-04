@@ -1,8 +1,8 @@
 use std::path::Path;
 use tantivy::{
-    directory::MmapDirectory,
-    schema::{Field, Schema, FAST, STORED, STRING, TEXT},
     Index, IndexReader, IndexSettings, IndexWriter, TantivyDocument, Term,
+    directory::MmapDirectory,
+    schema::{FAST, Field, STORED, STRING, Schema, TEXT},
 };
 
 use crate::error::IndexError;

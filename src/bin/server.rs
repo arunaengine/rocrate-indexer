@@ -7,6 +7,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
+use tracing::info;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -21,6 +24,7 @@ use rocrate_indexer::{CrateIndex, CrateSource, SharedCrateIndex};
         add_crate_by_upload,
         list_crates,
         get_crate,
+        get_crate_info,
         remove_crate,
         search,
     ),
@@ -30,6 +34,7 @@ use rocrate_indexer::{CrateIndex, CrateSource, SharedCrateIndex};
             AddCrateResponse,
             CrateAddedInfo,
             ListCratesResponse,
+            CrateInfoResponse,
             SearchParams,
             SearchResponse,
             SearchHitResponse,
@@ -74,10 +79,38 @@ struct AddCrateResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 struct ListCratesResponse {
-    /// List of all indexed crate IDs
-    crates: Vec<String>,
+    /// List of all indexed crate IDs (when full=false)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crates: Option<Vec<String>>,
+    /// List of full crate info (when full=true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entries: Option<Vec<CrateInfoResponse>>,
     /// Total count of indexed crates
     count: usize,
+}
+
+/// Short info about an indexed crate
+#[derive(Debug, Serialize, ToSchema)]
+struct CrateInfoResponse {
+    /// The unique identifier for this crate
+    crate_id: String,
+    /// Full path including this crate (from root to this crate)
+    full_path: Vec<String>,
+    /// Human-readable name extracted from the crate metadata
+    name: Option<String>,
+    /// Description extracted from the crate metadata  
+    description: Option<String>,
+    /// Whether this is a root-level crate (no parents)
+    is_root: bool,
+    /// The direct parent crate ID, if any
+    parent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema, utoipa::IntoParams)]
+struct ListCratesParams {
+    /// Return full info for each crate (default: false, returns only IDs)
+    #[serde(default)]
+    full: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema, utoipa::IntoParams)]
@@ -344,23 +377,51 @@ async fn extract_file_from_multipart(
     get,
     path = "/crates",
     tag = "crates",
+    params(ListCratesParams),
     responses(
-        (status = 200, description = "List of crate IDs", body = ListCratesResponse),
+        (status = 200, description = "List of crate IDs or full info", body = ListCratesResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
-async fn list_crates(State(index): State<SharedCrateIndex>) -> impl IntoResponse {
+async fn list_crates(
+    State(index): State<SharedCrateIndex>,
+    Query(params): Query<ListCratesParams>,
+) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(move || {
         let idx = index.read().map_err(|e| format!("Lock error: {}", e))?;
-        Ok::<_, String>(idx.list_crates())
+        if params.full {
+            let entries: Vec<CrateInfoResponse> = idx
+                .list_crate_entries()
+                .into_iter()
+                .map(|entry| CrateInfoResponse {
+                    crate_id: entry.crate_id.clone(),
+                    full_path: entry.full_path.clone(),
+                    name: entry.name.clone(),
+                    description: entry.description.clone(),
+                    is_root: entry.is_root(),
+                    parent_id: entry.parent_id().map(String::from),
+                })
+                .collect();
+            let count = entries.len();
+            Ok::<_, String>(ListCratesResponse {
+                crates: None,
+                entries: Some(entries),
+                count,
+            })
+        } else {
+            let crates = idx.list_crates();
+            let count = crates.len();
+            Ok(ListCratesResponse {
+                crates: Some(crates),
+                entries: None,
+                count,
+            })
+        }
     })
     .await;
 
     match result {
-        Ok(Ok(crates)) => {
-            let count = crates.len();
-            (StatusCode::OK, Json(ListCratesResponse { crates, count })).into_response()
-        }
+        Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
@@ -405,6 +466,65 @@ async fn get_crate(
         Ok(Ok(Some(json))) => {
             (StatusCode::OK, [("content-type", "application/json")], json).into_response()
         }
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Crate not found".to_string(),
+            }),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Task join error: {}", e),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Get short info (name, description, ancestry path) for a crate
+#[utoipa::path(
+    get,
+    path = "/crates/{crate_id}/info",
+    tag = "crates",
+    params(
+        ("crate_id" = String, Path, description = "The crate ID (URL-encoded if necessary)")
+    ),
+    responses(
+        (status = 200, description = "Crate info", body = CrateInfoResponse),
+        (status = 404, description = "Crate not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    )
+)]
+async fn get_crate_info(
+    State(index): State<SharedCrateIndex>,
+    Path(crate_id): Path<String>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || {
+        let idx = index.read().map_err(|e| format!("Lock error: {}", e))?;
+
+        match idx.get_crate_info(&crate_id) {
+            Some(entry) => Ok(Some(CrateInfoResponse {
+                crate_id: entry.crate_id.clone(),
+                full_path: entry.full_path.clone(),
+                name: entry.name.clone(),
+                description: entry.description.clone(),
+                is_root: entry.is_root(),
+                parent_id: entry.parent_id().map(String::from),
+            })),
+            None => Ok(None),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(info))) => (StatusCode::OK, Json(info)).into_response(),
         Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -542,6 +662,18 @@ async fn search(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing subscriber with env filter
+    // Use RUST_LOG env var to control log level (e.g., RUST_LOG=debug)
+    // Default: only show logs from rocrate_indexer and rocrate_server, skip tantivy/tower
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new("warn,rocrate_indexer=info,rocrate_server=info")
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
     let port = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -549,10 +681,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
 
-    println!("Initializing RO-Crate index...");
+    info!("Initializing RO-Crate index...");
     let index = CrateIndex::open_or_create()?;
     let crate_count = index.crate_count();
-    println!("Loaded {} crates from index", crate_count);
+    info!(crate_count, "Loaded crates from index");
 
     let shared_index: SharedCrateIndex = index.into_shared();
 
@@ -566,6 +698,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/crates/upload", post(add_crate_by_upload))
         .route("/crates/{crate_id}", get(get_crate))
         .route("/crates/{crate_id}", delete(remove_crate))
+        .route("/crates/{crate_id}/info", get(get_crate_info))
         .route("/search", get(search))
         .with_state(shared_index)
         .layer(
@@ -573,13 +706,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
+        )
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                    )
+                })
+                .on_response(
+                    |response: &axum::http::Response<_>,
+                     latency: std::time::Duration,
+                     _span: &tracing::Span| {
+                        tracing::info!(
+                            status = %response.status(),
+                            latency = ?latency,
+                            "response"
+                        );
+                    },
+                ),
         );
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", bind_addr, port)).await?;
-    println!("Server running at http://{}:{}", bind_addr, port);
-    println!(
-        "Swagger UI available at http://{}:{}/swagger-ui/",
-        bind_addr, port
+    info!(bind_addr, port, "Server running");
+    info!(
+        swagger_url = format!("http://{}:{}/swagger-ui/", bind_addr, port),
+        "Swagger UI available"
     );
 
     axum::serve(listener, app).await?;

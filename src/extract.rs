@@ -27,6 +27,15 @@ pub struct SubcrateInfo {
     pub is_relative: bool,
 }
 
+/// Metadata extracted from the root entity of an RO-Crate
+#[derive(Debug, Clone, Default)]
+pub struct RootMetadata {
+    /// Human-readable name of the crate
+    pub name: Option<String>,
+    /// Description of the crate
+    pub description: Option<String>,
+}
+
 /// Extract full-text searchable content from a JSON-LD entity
 pub fn extract_text(entity: &Value) -> String {
     let mut parts = Vec::new();
@@ -143,6 +152,79 @@ fn extract_subject_of_url(entity: &Value) -> Option<String> {
     }
 }
 
+/// Find the root Dataset entity in an RO-Crate graph
+/// The root is typically the entity with @id "./" that conforms to RO-Crate
+pub fn find_root_entity(entities: &[Value]) -> Option<&Value> {
+    // First, try to find entity with @id "./" that is a Dataset
+    for entity in entities {
+        let id = extract_id(entity);
+        let types = extract_types(entity);
+
+        if id == Some("./") && types.iter().any(|t| t == "Dataset") {
+            return Some(entity);
+        }
+    }
+
+    // Fallback: find any Dataset that conforms to RO-Crate spec (but not a subcrate reference)
+    for entity in entities {
+        let types = extract_types(entity);
+        if !types.iter().any(|t| t == "Dataset") {
+            continue;
+        }
+
+        // Must conform to RO-Crate
+        if !conforms_to_rocrate(entity) {
+            continue;
+        }
+
+        // Skip if it looks like a subcrate reference (has subjectOf pointing elsewhere)
+        // The root entity typically doesn't have subjectOf, or it points to the metadata descriptor
+        let id = extract_id(entity).unwrap_or("");
+        if id != "./" && !id.is_empty() {
+            // This might be a subcrate reference, not the root
+            // Check if there's a subjectOf that's not the local metadata
+            if let Some(subject_of) = extract_subject_of_url(entity) {
+                if !subject_of.starts_with("ro-crate-metadata")
+                    && !subject_of.ends_with("ro-crate-metadata.json")
+                {
+                    continue;
+                }
+            }
+        }
+
+        return Some(entity);
+    }
+
+    None
+}
+
+/// Extract metadata (name, description) from the root entity of an RO-Crate
+pub fn extract_root_metadata(entities: &[Value]) -> RootMetadata {
+    let root = match find_root_entity(entities) {
+        Some(entity) => entity,
+        None => return RootMetadata::default(),
+    };
+
+    let name = root
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| clean_name(s));
+
+    let description = root
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    RootMetadata { name, description }
+}
+
+/// Clean up a name value (remove "./" prefix if present, trim whitespace)
+fn clean_name(name: &str) -> String {
+    let cleaned = name.trim();
+    let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
+    cleaned.to_string()
+}
+
 /// Find all Dataset entities that conform to RO-Crate (potential subcrates)
 /// Returns entity IDs for further processing
 pub fn find_potential_subcrates(entities: &[Value]) -> Vec<String> {
@@ -161,6 +243,10 @@ pub fn find_potential_subcrates(entities: &[Value]) -> Vec<String> {
         }
 
         if let Some(id) = extract_id(entity) {
+            // Skip the root entity
+            if id == "./" {
+                continue;
+            }
             subcrate_ids.push(id.to_string());
         }
     }
@@ -189,6 +275,11 @@ pub fn detect_subcrates_from_url(entities: &[Value], base_url: Option<&str>) -> 
             Some(id) => id.to_string(),
             None => continue,
         };
+
+        // Skip the root entity
+        if entity_id == "./" {
+            continue;
+        }
 
         // Try to get metadata URL from subjectOf
         let metadata_url = if let Some(subject_of) = extract_subject_of_url(entity) {
@@ -381,6 +472,12 @@ mod tests {
     fn test_find_potential_subcrates() {
         let entities = vec![
             serde_json::json!({
+                "@id": "./",
+                "@type": "Dataset",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "name": "Root Crate"
+            }),
+            serde_json::json!({
                 "@id": "./experiments/",
                 "@type": "Dataset",
                 "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
@@ -401,6 +498,8 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&"./experiments/".to_string()));
         assert!(ids.contains(&"./data/".to_string()));
+        // Should NOT contain "./" (root) or "./regular/" (no conformsTo)
+        assert!(!ids.contains(&"./".to_string()));
     }
 
     #[test]
@@ -419,5 +518,82 @@ mod tests {
             resolve_url("https://other.org/crate.json", base),
             "https://other.org/crate.json"
         );
+    }
+
+    #[test]
+    fn test_find_root_entity() {
+        let entities = vec![
+            serde_json::json!({
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "about": {"@id": "./"}
+            }),
+            serde_json::json!({
+                "@id": "./",
+                "@type": "Dataset",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "name": "My Research Data",
+                "description": "A dataset about interesting things"
+            }),
+            serde_json::json!({
+                "@id": "./subcrate/",
+                "@type": "Dataset",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "name": "Subcrate"
+            }),
+        ];
+
+        let root = find_root_entity(&entities);
+        assert!(root.is_some());
+        let root = root.unwrap();
+        assert_eq!(extract_id(root), Some("./"));
+        assert_eq!(
+            root.get("name").and_then(|v| v.as_str()),
+            Some("My Research Data")
+        );
+    }
+
+    #[test]
+    fn test_extract_root_metadata() {
+        let entities = vec![serde_json::json!({
+            "@id": "./",
+            "@type": "Dataset",
+            "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+            "name": "My Research Data",
+            "description": "A dataset containing experimental results"
+        })];
+
+        let metadata = extract_root_metadata(&entities);
+        assert_eq!(metadata.name, Some("My Research Data".to_string()));
+        assert_eq!(
+            metadata.description,
+            Some("A dataset containing experimental results".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_root_metadata_cleans_name() {
+        let entities = vec![serde_json::json!({
+            "@id": "./",
+            "@type": "Dataset",
+            "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+            "name": "./my-crate",
+            "description": "Test"
+        })];
+
+        let metadata = extract_root_metadata(&entities);
+        assert_eq!(metadata.name, Some("my-crate".to_string()));
+    }
+
+    #[test]
+    fn test_extract_root_metadata_missing() {
+        let entities = vec![serde_json::json!({
+            "@id": "./data.csv",
+            "@type": "File"
+        })];
+
+        let metadata = extract_root_metadata(&entities);
+        assert!(metadata.name.is_none());
+        assert!(metadata.description.is_none());
     }
 }

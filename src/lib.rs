@@ -14,14 +14,14 @@ use rocraters::ro_crate::rocrate::RoCrate;
 
 use crate::config::Config;
 use crate::error::IndexError;
-use crate::extract::{detect_subcrates_from_url, get_subcrate_entity_ids};
+use crate::extract::{detect_subcrates_from_url, extract_root_metadata, get_subcrate_entity_ids};
 use crate::index::SearchIndex;
 use crate::loader::find_subcrate_metadata_in_zip;
 use crate::query::QueryEngine;
 use crate::store::CrateStore;
 
 // Re-export key types for convenience
-pub use crate::config::{Config as IndexConfig, Manifest};
+pub use crate::config::{Config as IndexConfig, CrateEntry, Manifest};
 pub use crate::extract::SubcrateInfo;
 pub use crate::loader::CrateSource;
 pub use crate::query::SearchHit;
@@ -102,8 +102,8 @@ impl CrateIndex {
 
     /// Load all metadata files listed in manifest into memory
     fn load_all_metadata(&mut self) -> Result<(), IndexError> {
-        for crate_id in &self.manifest.crates.clone() {
-            let metadata_path = self.config.metadata_path_for_crate(crate_id);
+        for crate_id in self.manifest.crate_ids() {
+            let metadata_path = self.config.metadata_path_for_crate(&crate_id);
             if metadata_path.exists() {
                 let content = std::fs::read_to_string(&metadata_path)?;
                 let crate_data: RoCrate = rocraters::ro_crate::read::read_crate_obj(&content, 0)
@@ -129,6 +129,16 @@ impl CrateIndex {
 
     /// Add a crate from a source (path, zip, url) with automatic subcrate discovery
     pub fn add_from_source(&mut self, source: &CrateSource) -> Result<AddResult, IndexError> {
+        // Start with empty ancestry for root-level adds
+        self.add_from_source_with_ancestry(source, Vec::new())
+    }
+
+    /// Internal: Add a crate with explicit ancestry path
+    fn add_from_source_with_ancestry(
+        &mut self,
+        source: &CrateSource,
+        ancestry: Vec<String>,
+    ) -> Result<AddResult, IndexError> {
         let crate_id = source.to_crate_id();
 
         // Cycle detection: skip if already indexed
@@ -149,19 +159,34 @@ impl CrateIndex {
         // Convert to JSON for indexing and subcrate detection
         let entities = self.graph_to_json(&crate_data)?;
 
+        // Extract name and description from root entity
+        let root_metadata = extract_root_metadata(&entities);
+
         // Index the parent crate
         let entity_count = self.index_crate(&crate_id, &entities)?;
 
         // Store in memory
         self.store.insert(crate_id.clone(), crate_data);
 
-        // Update manifest
-        self.manifest.add_crate(crate_id.clone());
+        // Create and save manifest entry with ancestry and metadata
+        let entry = CrateEntry::with_parent(crate_id.clone(), ancestry.clone())
+            .with_name(root_metadata.name)
+            .with_description(root_metadata.description);
+        self.manifest.add_crate(entry);
         self.config.save_manifest(&self.manifest)?;
 
+        // Build ancestry for subcrates (current crate becomes part of their ancestry)
+        let mut subcrate_ancestry = ancestry;
+        subcrate_ancestry.push(crate_id.clone());
+
         // Discover and add subcrates based on source type
-        let subcrates =
-            self.discover_and_add_subcrates(source, &crate_id, &entities, &root_prefix)?;
+        let subcrates = self.discover_and_add_subcrates(
+            source,
+            &crate_id,
+            &entities,
+            &root_prefix,
+            subcrate_ancestry,
+        )?;
 
         Ok(AddResult {
             crate_id,
@@ -177,22 +202,23 @@ impl CrateIndex {
         parent_id: &str,
         entities: &[serde_json::Value],
         root_prefix: &str,
+        ancestry: Vec<String>,
     ) -> Result<Vec<AddResult>, IndexError> {
         match source {
             CrateSource::Url(_) | CrateSource::UrlSubcrate { .. } => {
                 // For URL sources, use subjectOf or default metadata path
                 let base_url = source.base_url();
                 let subcrate_infos = detect_subcrates_from_url(entities, base_url.as_deref());
-                self.add_url_subcrates(parent_id, subcrate_infos)
+                self.add_url_subcrates(parent_id, subcrate_infos, ancestry)
             }
             CrateSource::ZipFile { path: zip_path, .. }
             | CrateSource::ZipSubcrate { zip_path, .. } => {
                 // For zip sources, scan the archive for metadata files
-                self.add_zip_subcrates(parent_id, zip_path, entities, root_prefix)
+                self.add_zip_subcrates(parent_id, zip_path, entities, root_prefix, ancestry)
             }
             CrateSource::Directory(dir_path) => {
                 // For directory sources, look for subdirectories with metadata
-                self.add_directory_subcrates(parent_id, dir_path, entities)
+                self.add_directory_subcrates(parent_id, dir_path, entities, ancestry)
             }
         }
     }
@@ -202,6 +228,7 @@ impl CrateIndex {
         &mut self,
         parent_id: &str,
         subcrates: Vec<SubcrateInfo>,
+        ancestry: Vec<String>,
     ) -> Result<Vec<AddResult>, IndexError> {
         let mut results = Vec::new();
 
@@ -226,7 +253,7 @@ impl CrateIndex {
                 continue;
             }
 
-            match self.add_from_source(&source) {
+            match self.add_from_source_with_ancestry(&source, ancestry.clone()) {
                 Ok(result) => results.push(result),
                 Err(e) => {
                     // Log but don't fail - subcrate might not be accessible
@@ -245,6 +272,7 @@ impl CrateIndex {
         zip_path: &std::path::PathBuf,
         entities: &[serde_json::Value],
         root_prefix: &str,
+        ancestry: Vec<String>,
     ) -> Result<Vec<AddResult>, IndexError> {
         // Get potential subcrate entity IDs from the graph
         let entity_ids = get_subcrate_entity_ids(entities);
@@ -259,7 +287,7 @@ impl CrateIndex {
             .collect();
 
         // Add URL subcrates
-        let mut results = self.add_url_subcrates(parent_id, url_subcrates)?;
+        let mut results = self.add_url_subcrates(parent_id, url_subcrates, ancestry.clone())?;
 
         // Find matching metadata files in the zip based on entity IDs
         let zip_matches = find_subcrate_metadata_in_zip(zip_path, &entity_ids, root_prefix)?;
@@ -277,7 +305,7 @@ impl CrateIndex {
                 continue;
             }
 
-            match self.add_from_source(&source) {
+            match self.add_from_source_with_ancestry(&source, ancestry.clone()) {
                 Ok(result) => results.push(result),
                 Err(e) => {
                     eprintln!("Warning: Failed to add zip subcrate {}: {}", entity_id, e);
@@ -294,6 +322,7 @@ impl CrateIndex {
         parent_id: &str,
         dir_path: &std::path::PathBuf,
         entities: &[serde_json::Value],
+        ancestry: Vec<String>,
     ) -> Result<Vec<AddResult>, IndexError> {
         let entity_ids = get_subcrate_entity_ids(entities);
         if entity_ids.is_empty() {
@@ -325,7 +354,7 @@ impl CrateIndex {
             }
 
             // Load and index with inherited ID
-            match self.add_directory_subcrate(&subcrate_id, &subdir) {
+            match self.add_directory_subcrate(&subcrate_id, &subdir, ancestry.clone()) {
                 Ok(result) => results.push(result),
                 Err(e) => {
                     eprintln!(
@@ -344,6 +373,7 @@ impl CrateIndex {
         &mut self,
         crate_id: &str,
         dir_path: &std::path::PathBuf,
+        ancestry: Vec<String>,
     ) -> Result<AddResult, IndexError> {
         let (crate_data, raw_json) = loader::load_from_directory_with_json(dir_path)?;
 
@@ -353,15 +383,29 @@ impl CrateIndex {
 
         // Convert and index
         let entities = self.graph_to_json(&crate_data)?;
+
+        // Extract name and description
+        let root_metadata = extract_root_metadata(&entities);
+
         let entity_count = self.index_crate(crate_id, &entities)?;
 
         // Store
         self.store.insert(crate_id.to_string(), crate_data);
-        self.manifest.add_crate(crate_id.to_string());
+
+        // Create entry with ancestry
+        let entry = CrateEntry::with_parent(crate_id.to_string(), ancestry.clone())
+            .with_name(root_metadata.name)
+            .with_description(root_metadata.description);
+        self.manifest.add_crate(entry);
         self.config.save_manifest(&self.manifest)?;
 
+        // Build ancestry for nested subcrates
+        let mut subcrate_ancestry = ancestry;
+        subcrate_ancestry.push(crate_id.to_string());
+
         // Recursive subcrate discovery
-        let subcrates = self.add_directory_subcrates(crate_id, dir_path, &entities)?;
+        let subcrates =
+            self.add_directory_subcrates(crate_id, dir_path, &entities, subcrate_ancestry)?;
 
         Ok(AddResult {
             crate_id: crate_id.to_string(),
@@ -493,14 +537,24 @@ impl CrateIndex {
         }
     }
 
+    /// Get crate entry info from manifest
+    pub fn get_crate_info(&self, crate_id: &str) -> Option<&CrateEntry> {
+        self.manifest.get(crate_id)
+    }
+
     /// List all indexed crate IDs
     pub fn list_crates(&self) -> Vec<String> {
-        self.manifest.crates.clone()
+        self.manifest.crate_ids()
+    }
+
+    /// Get all crate entries
+    pub fn list_crate_entries(&self) -> Vec<&CrateEntry> {
+        self.manifest.crates.values().collect()
     }
 
     /// Number of indexed crates
     pub fn crate_count(&self) -> usize {
-        self.manifest.crates.len()
+        self.manifest.len()
     }
 
     /// Convert RoCrate graph to JSON values for indexing
@@ -556,14 +610,20 @@ impl CrateIndex {
         // Convert to JSON for indexing
         let entities = self.graph_to_json(&crate_data)?;
 
+        // Extract name and description
+        let root_metadata = extract_root_metadata(&entities);
+
         // Index the crate
         let entity_count = self.index_crate(&crate_id, &entities)?;
 
         // Store in memory
         self.store.insert(crate_id.clone(), crate_data);
 
-        // Update manifest
-        self.manifest.add_crate(crate_id.clone());
+        // Create manifest entry (root level, no ancestry)
+        let entry = CrateEntry::new(crate_id.clone())
+            .with_name(root_metadata.name)
+            .with_description(root_metadata.description);
+        self.manifest.add_crate(entry);
         self.config.save_manifest(&self.manifest)?;
 
         // For JSON uploads, check for URL subcrates only (no local file access)
@@ -571,7 +631,10 @@ impl CrateIndex {
             .into_iter()
             .filter(|s| !s.is_relative)
             .collect();
-        let subcrates = self.add_url_subcrates(&crate_id, url_subcrates)?;
+
+        // Ancestry for subcrates is just this crate
+        let subcrate_ancestry = vec![crate_id.clone()];
+        let subcrates = self.add_url_subcrates(&crate_id, url_subcrates, subcrate_ancestry)?;
 
         Ok(AddResult {
             crate_id,

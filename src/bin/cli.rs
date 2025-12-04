@@ -37,11 +37,26 @@ enum Commands {
         crates_only: bool,
     },
     /// List all indexed crate IDs
-    List,
+    List {
+        /// Show detailed info (name, description, path) for each crate
+        #[arg(short, long)]
+        verbose: bool,
+        /// Output as JSON (includes full info for all crates)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show full metadata JSON for a crate
     Show {
         /// Crate ID to show
         crate_id: String,
+    },
+    /// Show short info (name, description, ancestry path) for a crate
+    Info {
+        /// Crate ID to get info for
+        crate_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a crate from the index
     Remove {
@@ -87,18 +102,107 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::List => {
-            let crates = index.list_crates();
-            if crates.is_empty() {
-                println!("No crates indexed.");
+        Commands::List { verbose, json } => {
+            let entries = index.list_crate_entries();
+            if entries.is_empty() {
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No crates indexed.");
+                }
+            } else if json {
+                // Output as JSON array with full info
+                let output: Vec<_> = entries
+                    .iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "crate_id": entry.crate_id,
+                            "name": entry.name,
+                            "description": entry.description,
+                            "full_path": entry.full_path,
+                            "is_root": entry.is_root(),
+                            "parent_id": entry.parent_id(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else if verbose {
+                for entry in entries {
+                    println!("ID: {}", entry.crate_id);
+                    if let Some(ref name) = entry.name {
+                        println!("  Name: {}", name);
+                    }
+                    if let Some(ref desc) = entry.description {
+                        // Truncate long descriptions
+                        let truncated = if desc.len() > 100 {
+                            format!("{}...", &desc[..100])
+                        } else {
+                            desc.clone()
+                        };
+                        println!("  Description: {}", truncated);
+                    }
+                    if entry.full_path.len() > 1 {
+                        println!("  Path: {}", entry.full_path.join(" > "));
+                    }
+                    println!();
+                }
             } else {
-                for crate_id in crates {
-                    println!("{}", crate_id);
+                let crates = index.list_crates();
+                if crates.is_empty() {
+                    println!("No crates indexed.");
+                } else {
+                    for crate_id in crates {
+                        println!("{}", crate_id);
+                    }
                 }
             }
         }
         Commands::Show { crate_id } => match index.get_crate_json(&crate_id)? {
             Some(json) => println!("{}", json),
+            None => {
+                eprintln!("Crate not found: {}", crate_id);
+                std::process::exit(1);
+            }
+        },
+        Commands::Info { crate_id, json } => match index.get_crate_info(&crate_id) {
+            Some(entry) => {
+                if json {
+                    // Output as JSON
+                    let output = serde_json::json!({
+                        "crate_id": entry.crate_id,
+                        "name": entry.name,
+                        "description": entry.description,
+                        "full_path": entry.full_path,
+                        "is_root": entry.is_root(),
+                        "parent_id": entry.parent_id(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                } else {
+                    // Human-readable output
+                    println!("Crate ID: {}", entry.crate_id);
+
+                    if let Some(ref name) = entry.name {
+                        println!("Name: {}", name);
+                    } else {
+                        println!("Name: (not set)");
+                    }
+
+                    if let Some(ref desc) = entry.description {
+                        println!("Description: {}", desc);
+                    } else {
+                        println!("Description: (not set)");
+                    }
+
+                    if entry.is_root() {
+                        println!("Type: Root crate");
+                    } else {
+                        println!("Type: Subcrate");
+                        println!("Parent: {}", entry.parent_id().unwrap_or("unknown"));
+                    }
+
+                    println!("Full path: {}", entry.full_path.join(" > "));
+                }
+            }
             None => {
                 eprintln!("Crate not found: {}", crate_id);
                 std::process::exit(1);
